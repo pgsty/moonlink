@@ -383,6 +383,19 @@ impl TableHandler {
                     // ==============================
                     //
                     TableEvent::PeriodicalMooncakeTableSnapshot(uuid) => {
+                        // Replication may advance without a new commit or persistence
+                        // result for this table (including a completely empty table).
+                        if let Some(requested_lsn) = table_handler_state.largest_force_snapshot_lsn
+                        {
+                            let persisted_lsn = table_handler_state.get_persisted_table_lsn(
+                                table.get_persistence_snapshot_lsn(),
+                                *replication_lsn_rx.borrow(),
+                            );
+                            if persisted_lsn >= requested_lsn {
+                                table_handler_state.notify_persisted_table_lsn(persisted_lsn);
+                                table_handler_state.largest_force_snapshot_lsn = None;
+                            }
+                        }
                         // Only create a periodic snapshot if there isn't already one in progress
                         if table_handler_state.mooncake_snapshot_ongoing {
                             continue;
@@ -394,8 +407,16 @@ impl TableHandler {
                             // flush if needed
                             if let Some(commit_lsn) = table_handler_state.table_consistent_view_lsn
                             {
-                                if table_handler_state
-                                    .should_force_flush(commit_lsn, table.get_last_flush_lsn())
+                                // The requested database LSN may belong to a different
+                                // table. Once replication covers it, flush our older
+                                // committed rows without waiting for another write here.
+                                let progress_lsn =
+                                    std::cmp::max(commit_lsn, *replication_lsn_rx.borrow());
+                                if table.get_last_flush_lsn() < commit_lsn
+                                    && table_handler_state.should_force_flush(
+                                        progress_lsn,
+                                        table.get_last_flush_lsn(),
+                                    )
                                 {
                                     let event_id = uuid::Uuid::new_v4();
                                     table.flush(commit_lsn, event_id).unwrap();
