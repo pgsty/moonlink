@@ -50,7 +50,8 @@ iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "790e0253a6d1b
 iceberg-catalog-glue = { git = "https://github.com/apache/iceberg-rust", rev = "790e0253a6d1ba83a54f51cf8a8ed62a5c2da7f5" }
 iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", rev = "790e0253a6d1ba83a54f51cf8a8ed62a5c2da7f5" }
 itertools = "0.14"
-lru = "0.16"
+# RUSTSEC-2026-0253: pop() panic safety is fixed in 0.18.2.
+lru = "0.18.2"
 moka = { version = "0.12", features = ["future"] }
 moonlink = { path = "src/moonlink" }
 moonlink_backend = { path = "src/moonlink_backend" }
