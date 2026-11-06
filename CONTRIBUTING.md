@@ -16,7 +16,7 @@ You can choose between two approaches:
 
 1. Clone the repository
     ```bash
-    git clone https://github.com/Mooncake-Labs/moonlink.git
+    git clone https://github.com/pgsty/moonlink.git
     cd moonlink
     ```
 2. Open in VS Code
@@ -29,7 +29,7 @@ You can choose between two approaches:
 
 ### 2. GitHub Codespaces
 
-You just need to [create a new codespace](https://codespace.new/Mooncake-Labs/pg_mooncake).
+You just need to [create a new codespace](https://codespace.new/pgsty/moonlink).
 
 ---
 
@@ -48,4 +48,4 @@ cargo test --features storage-s3
 ---
 
 ## Formatting
-Formatting and linting is configured properly in devcontainer via [precommit hooks](https://github.com/Mooncake-Labs/moonlink/blob/main/.pre-commit-config.yaml), which automatically triggers before you push a commit.
+Formatting and linting is configured properly in devcontainer via [precommit hooks](https://github.com/pgsty/moonlink/blob/main/.pre-commit-config.yaml), which automatically triggers before you push a commit.
