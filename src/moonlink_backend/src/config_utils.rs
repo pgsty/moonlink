@@ -14,5 +14,11 @@ pub(crate) fn parse_replication_table_config(
         TableConfig::from_json_or_default(moonlink_table_config, table_base_path)?;
     table_config.mooncake_config.row_identity = Some(IdentityProp::FullRow);
     table_config.mooncake_config.append_only = Some(false);
-    table_config.take_as_moonlink_config(temp_files_dir.to_string(), mooncake_table_id)
+    let config =
+        table_config.take_as_moonlink_config(temp_files_dir.to_string(), mooncake_table_id)?;
+    crate::file_utils::validate_warehouse(
+        std::path::Path::new(table_base_path),
+        &config.iceberg_table_config,
+    )?;
+    Ok(config)
 }

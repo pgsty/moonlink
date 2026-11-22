@@ -1,15 +1,14 @@
 use crate::storage::table::iceberg::catalog_test_utils;
+use crate::storage::table::iceberg::file_catalog::FileCatalog;
 use crate::storage::table::iceberg::file_catalog_test_utils::*;
 use crate::storage::table::iceberg::moonlink_catalog::MoonlinkCatalog;
-use crate::storage::table::iceberg::table_commit_proxy::TableCommitProxy;
+use crate::storage::table::iceberg::moonlink_catalog::{CatalogAccess, PuffinWrite};
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iceberg::spec::{SnapshotReference, SnapshotRetention, MAIN_BRANCH};
-use iceberg::{
-    NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement, TableUpdate,
-};
+use iceberg::{NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate};
 
 /// This file contains testing logic which is general to all types of catalogs.
 ///
@@ -101,7 +100,9 @@ pub(crate) async fn test_catalog_table_operations_impl(catalog: &dyn MoonlinkCat
     assert_eq!(*table.metadata().current_schema().as_ref(), expected_schema,);
 
     // Drop the table and check.
-    catalog.drop_table(&table_ident).await.unwrap();
+    assert!(catalog.drop_table(&table_ident).await.is_err());
+    assert!(catalog.table_exists(&table_ident).await.unwrap());
+    catalog.purge_table(&table_ident).await.unwrap();
     let table_already_exists = catalog.table_exists(&table_ident).await.unwrap();
     assert!(!table_already_exists, "Table should not exist after drop");
 }
@@ -205,7 +206,7 @@ pub(crate) async fn test_list_operation_impl(catalog: &dyn MoonlinkCatalog) {
 }
 
 pub(crate) async fn test_update_table_impl(
-    catalog: &mut dyn MoonlinkCatalog,
+    catalog: &mut FileCatalog,
     namespace: String,
     table_name: String,
 ) {
@@ -254,16 +255,10 @@ pub(crate) async fn test_update_table_impl(
         }
     ]);
 
-    let table_commit_proxy = TableCommitProxy {
-        ident: table_ident.clone(),
-        requirements: vec![],
-        updates: table_updates,
-    };
-    let table_commit =
-        unsafe { std::mem::transmute::<TableCommitProxy, TableCommit>(table_commit_proxy) };
-
-    // Check table metadata.
-    let table = catalog.update_table(table_commit).await.unwrap();
+    let table = catalog
+        .commit_updates(&table_ident, vec![], table_updates)
+        .await
+        .unwrap();
     catalog.clear_puffin_metadata();
 
     let table_metadata = table.metadata();
@@ -300,7 +295,7 @@ pub(crate) async fn test_update_schema_impl(
 }
 
 pub(crate) async fn test_update_table_with_requirement_check_failed_impl(
-    catalog: &dyn MoonlinkCatalog,
+    catalog: &FileCatalog,
     namespace: String,
     table_name: String,
 ) {
@@ -311,16 +306,14 @@ pub(crate) async fn test_update_table_with_requirement_check_failed_impl(
     let table_ident = TableIdent::new(namespace.clone(), table_name.clone());
     catalog.load_metadata(&table_ident).await.unwrap();
 
-    let table_commit_proxy = TableCommitProxy {
-        ident: table_ident.clone(),
-        requirements: vec![TableRequirement::UuidMatch {
-            uuid: uuid::Uuid::new_v4(),
-        }],
-        updates: vec![],
-    };
-    let table_commit =
-        unsafe { std::mem::transmute::<TableCommitProxy, TableCommit>(table_commit_proxy) };
-
-    let res = catalog.update_table(table_commit).await;
+    let res = catalog
+        .commit_updates(
+            &table_ident,
+            vec![TableRequirement::UuidMatch {
+                uuid: uuid::Uuid::new_v4(),
+            }],
+            vec![],
+        )
+        .await;
     assert!(res.is_err());
 }

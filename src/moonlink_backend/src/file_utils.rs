@@ -1,7 +1,69 @@
 use crate::error::Result;
-use moonlink::{ObjectStorageCache, ObjectStorageCacheConfig};
+use moonlink::{
+    IcebergCatalogConfig, IcebergTableConfig, MooncakeTableId, ObjectStorageCache,
+    ObjectStorageCacheConfig, StorageConfig,
+};
 
 use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
+
+fn resolve_location(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut prefix = absolute.as_path();
+    loop {
+        match std::fs::canonicalize(prefix) {
+            Ok(resolved) => {
+                let suffix = absolute.strip_prefix(prefix).unwrap();
+                if suffix.components().any(|part| part == Component::ParentDir) {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "unresolved parent in warehouse path",
+                    ));
+                }
+                return Ok(resolved.join(suffix));
+            }
+            Err(err)
+                if err.kind() == ErrorKind::NotFound
+                    && std::fs::symlink_metadata(prefix)
+                        .is_err_and(|cause| cause.kind() == ErrorKind::NotFound) =>
+            {
+                prefix = prefix.parent().ok_or(err)?;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+pub(super) fn validate_warehouse(base: &Path, config: &IcebergTableConfig) -> Result<()> {
+    let base = resolve_location(base)?;
+    let IcebergCatalogConfig::File { accessor_config } = &config.metadata_accessor_config;
+    for accessor in [accessor_config, &config.data_accessor_config] {
+        #[allow(irrefutable_let_patterns)]
+        let StorageConfig::FileSystem { root_directory, .. } = &accessor.storage_config
+        else {
+            continue;
+        };
+        let root = resolve_location(Path::new(root_directory))?;
+        let path = root.join(&config.namespace[0]).join(&config.table_name);
+        let location = resolve_location(&path)?;
+        let reserved = location
+            .strip_prefix(&base)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .is_some_and(|part| {
+                part.as_os_str()
+                    .to_str()
+                    .is_none_or(|name| !MooncakeTableId::safe_namespace(name))
+            });
+        if location != path || base.starts_with(&location) || reserved {
+            return Err(crate::Error::invalid_config(format!(
+                "Iceberg location {} aliases another name or overlaps Moonlink internal storage",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Default local filesystem directory under the above base directory (which defaults to `PGDATA/pg_mooncake`) where all temporary files (used for union read) will be stored under.
 /// The whole directory is cleaned up at moonlink backend start, to prevent file leak.
@@ -98,6 +160,39 @@ pub fn recreate_directory(dir: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn validates_persistent_warehouse_before_cache_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let check = |root: &std::path::Path| {
+            let config = crate::table_config::TableConfig::from_json_or_default(
+                "{}",
+                root.to_str().unwrap(),
+            )
+            .unwrap();
+            let mut iceberg = moonlink::IcebergTableConfig::default();
+            iceberg.namespace = vec!["db".into()];
+            iceberg.table_name = "public.m".into();
+            iceberg.data_accessor_config = config.iceberg_config.unwrap();
+            iceberg.metadata_accessor_config = moonlink::IcebergCatalogConfig::File {
+                accessor_config: iceberg.data_accessor_config.clone(),
+            };
+            super::validate_warehouse(&base, &iceberg)
+        };
+        assert!(check(&base).is_ok());
+        assert!(check(&base.join("warehouse")).is_ok());
+        assert!(check(&base.join("temp").join("nested")).is_err());
+        let read_cache = base.join("read_through_cache");
+        std::fs::create_dir(&read_cache).unwrap();
+        assert!(check(&read_cache).is_err());
+        #[cfg(unix)]
+        {
+            let alias = base.join("alias");
+            std::os::unix::fs::symlink(&read_cache, &alias).unwrap();
+            assert!(check(&alias).is_err());
+        }
+    }
+
     use super::*;
 
     use tempfile::TempDir;

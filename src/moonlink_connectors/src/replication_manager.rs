@@ -432,7 +432,7 @@ impl ReplicationManager {
                 )
             })
             .collect();
-        placeholders.sort_by(|a, b| a.0.to_string().cmp(&b.0.to_string()));
+        placeholders.sort_by_key(|a| a.0.to_string());
         placeholders
     }
 
@@ -640,6 +640,22 @@ impl ReplicationManager {
         }
     }
 
+    pub fn source_watermark(
+        &self,
+        table: &MooncakeTableId,
+    ) -> Result<impl std::future::Future<Output = Result<u64>> + Send + 'static> {
+        let (_, connection) = self.get_replication_connection(table)?;
+        let client = connection.sql_client();
+        Ok(async move {
+            let row = client
+                .query_one("SELECT pg_catalog.pg_current_wal_insert_lsn()", &[])
+                .await?;
+            Ok(u64::from(
+                row.try_get::<_, tokio_postgres::types::PgLsn>(0)?,
+            ))
+        })
+    }
+
     pub fn get_table_reader(
         &self,
         mooncake_table_id: &MooncakeTableId,
@@ -661,7 +677,7 @@ impl ReplicationManager {
     /// Return mapping from mooncake table id to its table status readers.
     pub fn get_table_status_readers(&self) -> HashMap<MooncakeTableId, &TableStatusReader> {
         let mut table_state_readers = HashMap::with_capacity(self.connections.len());
-        for (_, (src_uri, _)) in self.table_info.iter() {
+        for (src_uri, _) in self.table_info.values() {
             let cur_repl_conn = self.connections.get(src_uri).unwrap_or_else(|| {
                 panic!("replication connection with uri {src_uri} should exist.")
             });

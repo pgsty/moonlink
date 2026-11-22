@@ -18,11 +18,11 @@
 // Code adapted from iceberg-rust: https://github.com/apache/iceberg-rust
 
 use iceberg::arrow::DEFAULT_MAP_FIELD_NAME;
-use iceberg::io::FileIOBuilder;
+use iceberg::io::FileIO;
 use iceberg::spec::{
     visit_schema, DataContentType, DataFile, DataFileBuilder, DataFileFormat, ListType, MapType,
     NestedFieldRef, PrimitiveType, Schema, SchemaRef, SchemaVisitor, Struct, StructType,
-    TableMetadata,
+    TableMetadata, VariantType,
 };
 use iceberg::Result as IcebergResult;
 use iceberg::{Error as IcebergError, ErrorKind};
@@ -144,6 +144,13 @@ impl SchemaVisitor for IndexByParquetPathName {
         Ok(())
     }
 
+    fn variant(&mut self, _variant: &VariantType) -> IcebergResult<Self::T> {
+        Err(IcebergError::new(
+            ErrorKind::FeatureUnsupported,
+            "Moonlink does not write Iceberg variant columns",
+        ))
+    }
+
     fn primitive(&mut self, _p: &PrimitiveType) -> IcebergResult<Self::T> {
         let full_name = self.field_names.iter().map(String::as_str).join(".");
         let field_id = self.field_id;
@@ -232,13 +239,13 @@ fn parquet_to_data_file_builder(
         // - We can ignore implementing distinct_counts due to this: https://lists.apache.org/thread/j52tsojv0x4bopxyzsp7m7bqt23n5fnd
         .lower_bounds(lower_bounds)
         .upper_bounds(upper_bounds)
-        .split_offsets(
+        .split_offsets(Some(
             metadata
                 .row_groups()
                 .iter()
                 .filter_map(|group| group.file_offset())
                 .collect(),
-        );
+        ));
 
     Ok(builder)
 }
@@ -251,7 +258,7 @@ fn parquet_to_data_file_builder(
 pub(crate) async fn get_parquet_metadata(
     local_parquet_file: &str,
 ) -> IcebergResult<(ParquetMetaData, usize /*file size*/)> {
-    let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+    let file_io = FileIO::new_with_fs();
     let input_file = file_io.new_input(local_parquet_file)?;
     let file_metadata = input_file.metadata().await?;
     let file_size = file_metadata.size as usize;
@@ -373,7 +380,7 @@ mod tests {
         let local_filepath = tmp_dir.path().join("src.parquet");
         let file = tokio::fs::File::create(&local_filepath).await.unwrap();
         let props = WriterProperties::builder()
-            .set_max_row_group_size(max_row_group_size)
+            .set_max_row_group_row_count(Some(max_row_group_size))
             .build();
         let mut writer = AsyncArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
         writer.write(&record_batch).await.unwrap();

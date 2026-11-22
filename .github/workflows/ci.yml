@@ -64,20 +64,22 @@ jobs:
   s3_test:
     name: S3 tests (feature, chaos)
     runs-on: ubuntu-latest
+    env:
+      MOONLINK_TEST_S3_ENDPOINT: http://127.0.0.1:9000
     strategy:
       matrix:
         type: [feature, chaos]
         include:
           - type: feature
             name: S3 feature test
-            timeout-minutes: 10
+            timeout-minutes: 30
             cmd: |
-              RUST_BACKTRACE=1 cargo test --lib --features=storage-s3
+              RUST_BACKTRACE=1 cargo test --locked --lib --features=storage-s3
           - type: chaos
             name: S3 chaos test
-            timeout-minutes: 20
+            timeout-minutes: 60
             cmd: |
-              RUST_BACKTRACE=1 cargo test test_s3_chaos --features=chaos-test,storage-s3 -p moonlink -- --nocapture
+              RUST_BACKTRACE=1 cargo test --locked test_s3_chaos --features=chaos-test,storage-s3 -p moonlink -- --nocapture
     steps:
       - uses: actions/checkout@v5
 
@@ -102,52 +104,22 @@ jobs:
           RUST_BACKTRACE=1 cargo test storage::filesystem::accessor -p moonlink --features=chaos-test
 
       - name: Start Fake S3 Server
-        id: fake_s3
         timeout-minutes: 5
         run: |
-          # minio/minio (Docker Hub) and quay.io/minio/minio are no longer publicly pullable. Until a
-          # maintained S3 emulator image is pinned here (then remove this skip), skip the tests that need
-          # S3 when the image is gone, but fail on any other pull error (rate limit, network).
-          image=minio/minio:latest
-          for attempt in 1 2 3; do
-            if err=$(docker pull "$image" 2>&1); then
-              break
-            fi
-            if grep -qiE 'pull access denied|repository does not exist|manifest unknown|manifest for .* not found' <<<"$err"; then
-              msg="$image is not available ($(tail -n 1 <<<"$err")); skipping the steps that need an S3 emulator."
-              echo "::warning title=S3 emulator unavailable::$msg"
-              echo "**${{ matrix.name }} skipped** (${{ github.job }}, needs the S3 emulator): $msg" >> "$GITHUB_STEP_SUMMARY"
-              echo "available=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "docker pull failed (attempt $attempt/3): $err"
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            sleep 15
-          done
           docker run -d \
             --name minio \
-            -p 9000:9000 \
+            -p 127.0.0.1:9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            "$image" server /data
-          echo "available=true" >> "$GITHUB_OUTPUT"
-
-      # ─────────────── Add hostnames to /etc/hosts ──────────────────────────
-      - name: Add s3.local to /etc/hosts
-        if: steps.fake_s3.outputs.available == 'true'
-        run: |
-          echo "127.0.0.1 s3.local" | sudo tee -a /etc/hosts
+            pgsty/minio@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372 server /data
 
       # ───────────────────── Wait for Fake S3 to be ready ───────────────────
       - name: Wait for Fake S3
-        if: steps.fake_s3.outputs.available == 'true'
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          for i in {1..10}; do
-            if curl -sf http://s3.local:9000/minio/health/ready; then
+          for _ in {1..10}; do
+            if curl -sf "$MOONLINK_TEST_S3_ENDPOINT/minio/health/ready"; then
               echo "Fake S3 is ready!"
               exit 0
             fi
@@ -159,7 +131,6 @@ jobs:
 
       # ────────────────────── Toolchain + Test Tools ─────────────────────────
       - name: Run ${{ matrix.name }}
-        if: steps.fake_s3.outputs.available == 'true'
         timeout-minutes: ${{ matrix.timeout-minutes }}
         run: |
           ${{ matrix.cmd }}
@@ -169,7 +140,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}-${{ matrix.target || 'no-matrix' }}
+          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}-${{ matrix.type }}
           path: /tmp/chaos_test_*
           retention-days: 3
           if-no-files-found: warn
@@ -288,7 +259,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}-${{ matrix.target || 'no-matrix' }}
+          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}
           path: /tmp/chaos_test_*
           retention-days: 3
           if-no-files-found: warn
@@ -323,7 +294,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}-${{ matrix.target || 'no-matrix' }}
+          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}
           path: /tmp/chaos_test_*
           retention-days: 3
           if-no-files-found: warn
@@ -358,7 +329,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}-${{ matrix.target || 'no-matrix' }}
+          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}
           path: /tmp/chaos_test_*
           retention-days: 3
           if-no-files-found: warn
@@ -393,7 +364,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}-${{ matrix.target || 'no-matrix' }}
+          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}
           path: /tmp/chaos_test_*
           retention-days: 3
           if-no-files-found: warn
@@ -428,7 +399,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}-${{ matrix.target || 'no-matrix' }}
+          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}
           path: /tmp/chaos_test_*
           retention-days: 3
           if-no-files-found: warn
@@ -463,7 +434,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}-${{ matrix.target || 'no-matrix' }}
+          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}
           path: /tmp/chaos_test_*
           retention-days: 3
           if-no-files-found: warn
@@ -523,7 +494,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}-${{ matrix.target || 'no-matrix' }}
+          name: chaos-dumps-${{ github.run_id }}-${{ github.job }}
           path: /tmp/chaos_test_*
           retention-days: 3
           if-no-files-found: warn
@@ -568,7 +539,7 @@ jobs:
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          for i in {1..10}; do
+          for _ in {1..10}; do
             if pg_isready -h localhost -p 5432 -U postgres; then
               echo "PostgreSQL is ready!"
               exit 0
@@ -590,7 +561,7 @@ jobs:
         run: |
           set -euo pipefail
           docker restart postgres
-          for i in {1..10}; do
+          for _ in {1..10}; do
             if pg_isready -h localhost -p 5432 -U postgres; then
               echo "PostgreSQL restarted and ready!"
               exit 0

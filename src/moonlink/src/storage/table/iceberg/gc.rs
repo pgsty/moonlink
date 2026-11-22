@@ -230,25 +230,26 @@ impl IcebergTableManager {
     /// files are referenced from inside the file index puffin blobs, which are only read with
     /// `with_index_blocks` (the loaded version's blocks are known without reading them).
     async fn referenced_files(
-        metadata: &TableMetadata,
-        file_io: &iceberg::io::FileIO,
+        table: &iceberg::table::Table,
         with_index_blocks: bool,
     ) -> Result<HashSet<String>> {
         let mut referenced = HashSet::new();
-        let Some(snapshot) = metadata.current_snapshot() else {
+        let Some(snapshot) = table.metadata().current_snapshot() else {
             return Ok(referenced);
         };
         referenced.insert(basename(snapshot.manifest_list()).to_string());
-        let manifest_list = snapshot.load_manifest_list(file_io, metadata).await?;
+        let manifest_list = table.manifest_list_reader(snapshot).load().await?;
         for manifest_file in manifest_list.entries() {
             referenced.insert(basename(&manifest_file.manifest_path).to_string());
-            let manifest = manifest_file.load_manifest(file_io).await?;
+            let manifest = table.manifest_reader().read(manifest_file).await?;
             for entry in manifest.entries() {
                 referenced.insert(basename(entry.data_file().file_path()).to_string());
                 if with_index_blocks && utils::is_file_index(entry) {
-                    let blob =
-                        FileIndexBlob::load_from_index_blob(file_io.clone(), entry.data_file())
-                            .await?;
+                    let blob = FileIndexBlob::load_from_index_blob(
+                        table.file_io().clone(),
+                        entry.data_file(),
+                    )
+                    .await?;
                     for block in blob.file_index.index_block_files.iter() {
                         referenced.insert(basename(&block.filepath).to_string());
                     }
@@ -264,13 +265,20 @@ impl IcebergTableManager {
     async fn referenced_by_metadata_file(
         &self,
         path: &str,
-        file_io: &iceberg::io::FileIO,
+        table: &iceberg::table::Table,
     ) -> Option<HashSet<String>> {
         let bytes = self.filesystem_accessor.read_object(path).await.ok()?;
         let Ok(metadata) = serde_json::from_slice::<TableMetadata>(&bytes) else {
             return Some(HashSet::new());
         };
-        match Self::referenced_files(&metadata, file_io, /*with_index_blocks=*/ true).await {
+        let previous = iceberg::table::Table::builder()
+            .runtime(iceberg::Runtime::try_current().ok()?)
+            .identifier(table.identifier().clone())
+            .file_io(table.file_io().clone())
+            .metadata(metadata)
+            .build()
+            .ok()?;
+        match Self::referenced_files(&previous, /*with_index_blocks=*/ true).await {
             Ok(referenced) => Some(referenced),
             Err(e) => {
                 tracing::warn!(error = ?e, path, "cannot read the files the previous iceberg version references");
@@ -314,11 +322,10 @@ impl IcebergTableManager {
         let Some(current_version) = self.hinted_version(&metadata_dir).await else {
             return Ok(());
         };
-        let file_io = table.file_io().clone();
 
         // Everything the current version references, by file name (names are unique).
         let current_referenced =
-            Self::referenced_files(metadata, &file_io, /*with_index_blocks=*/ false).await?;
+            Self::referenced_files(table, /*with_index_blocks=*/ false).await?;
         // The predecessor version stays loadable as a fallback, so its files are kept too. After a
         // commit they are what the current version referenced at the previous run; at load, read
         // them from its metadata file.
@@ -338,7 +345,7 @@ impl IcebergTableManager {
             (Some(previous), _) if trigger == GcTrigger::Commit => Some(previous),
             (_, Some(version)) => {
                 let path = format!("{metadata_dir}/v{version}.metadata.json");
-                self.referenced_by_metadata_file(&path, &file_io).await
+                self.referenced_by_metadata_file(&path, table).await
             }
             (_, None) => Some(HashSet::new()),
         };

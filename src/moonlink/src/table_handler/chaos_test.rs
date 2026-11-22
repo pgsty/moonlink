@@ -338,7 +338,7 @@ impl ChaosState {
 
     /// Util function to decide whether there's any updated rows, which are not deleted in the current transaction.
     fn has_updated_undeleted_row(&self) -> bool {
-        for (id, _) in self.uncommitted_updated_rows.iter() {
+        for id in self.uncommitted_updated_rows.keys() {
             if !self.deleted_uncommitted_row_ids.contains(id)
                 && !self.deleted_committed_row_ids.contains(id)
             {

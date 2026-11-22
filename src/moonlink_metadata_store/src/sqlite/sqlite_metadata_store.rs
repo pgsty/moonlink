@@ -23,6 +23,47 @@ pub struct SqliteMetadataStore {
 
 #[async_trait]
 impl MetadataStoreTrait for SqliteMetadataStore {
+    async fn registration(&self, database: &str, table: &str) -> Result<Option<String>> {
+        if !self.metadata_table_exists().await? {
+            return Ok(None);
+        }
+        let conn = SqliteConnWrapper::new(&self.database_uri).await?;
+        Ok(sqlx::query_scalar(
+            r#"SELECT coalesce(json_extract(config, '$.registration'), 'legacy')
+               FROM tables WHERE "database" = ? AND "table" = ?"#,
+        )
+        .bind(database)
+        .bind(table)
+        .fetch_optional(&conn.pool)
+        .await?)
+    }
+
+    async fn registered_databases(&self) -> Result<Vec<String>> {
+        if !self.metadata_table_exists().await? {
+            return Ok(Vec::new());
+        }
+        let conn = SqliteConnWrapper::new(&self.database_uri).await?;
+        Ok(
+            sqlx::query_scalar(r#"SELECT DISTINCT "database" FROM tables ORDER BY 1"#)
+                .fetch_all(&conn.pool)
+                .await?,
+        )
+    }
+
+    async fn managed_registrations(&self, database: &str) -> Result<Vec<(String, String)>> {
+        if !self.metadata_table_exists().await? {
+            return Ok(Vec::new());
+        }
+        let conn = SqliteConnWrapper::new(&self.database_uri).await?;
+        Ok(sqlx::query_as(
+            r#"SELECT "table", json_extract(config, '$.registration') FROM tables
+               WHERE "database" = ? AND json_extract(config, '$.registration') GLOB 'pg-*'"#,
+        )
+        .bind(database)
+        .fetch_all(&conn.pool)
+        .await?)
+    }
+
     async fn metadata_table_exists(&self) -> Result<bool> {
         let sqlite_conn = SqliteConnWrapper::new(&self.database_uri).await?;
         utils::table_exists(&sqlite_conn.pool, MOONLINK_SCHEMA, MOONLINK_METADATA_TABLE).await
@@ -74,6 +115,7 @@ impl MetadataStoreTrait for SqliteMetadataStore {
         src_table_name: &str,
         src_table_uri: &str,
         moonlink_table_config: MoonlinkTableConfig,
+        generation: &str,
     ) -> Result<()> {
         let serialized_config = config_utils::parse_moonlink_table_config(moonlink_table_config)?;
         let serialized_config = serde_json::to_string(&serialized_config)?;
@@ -94,7 +136,7 @@ impl MetadataStoreTrait for SqliteMetadataStore {
         let rows_affected = sqlx::query(
             r#"
             INSERT INTO tables ("database", "table", src_table_name, src_table_uri, config)
-            VALUES (?, ?, ?, ?, ?);
+            VALUES (?, ?, ?, ?, json_set(?, '$.registration', ?));
             "#,
         )
         .bind(database)
@@ -102,6 +144,7 @@ impl MetadataStoreTrait for SqliteMetadataStore {
         .bind(src_table_name)
         .bind(src_table_uri)
         .bind(serialized_config)
+        .bind(generation)
         .execute(&mut *tx)
         .await?
         .rows_affected();

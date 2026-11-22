@@ -5,7 +5,7 @@ use crate::storage::table::iceberg::parquet_utils;
 
 use std::path::Path;
 
-use iceberg::io::{FileIO, FileIOBuilder};
+use iceberg::io::FileIO;
 use iceberg::spec::DataFile;
 use iceberg::spec::TableMetadata as IcebergTableMetadata;
 use iceberg::table::Table as IcebergTable;
@@ -25,7 +25,7 @@ fn generate_unique_data_filepath(
         .to_str()
         .unwrap()
         .to_string();
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_generator = DefaultLocationGenerator::new(table.metadata())?;
     let remote_filepath = location_generator.generate_location(
         /*partition_key=*/ None,
         &format!(
@@ -80,7 +80,7 @@ pub(crate) async fn upload_index_file(
         .to_str()
         .unwrap()
         .to_string();
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let location_generator = DefaultLocationGenerator::new(table.metadata()).unwrap();
     let remote_filepath =
         location_generator.generate_location(/*partition_key=*/ None, &filename);
     filesystem_accessor
@@ -101,7 +101,7 @@ pub(crate) async fn upload_index_file(
 pub(crate) fn create_file_io(accessor_config: &AccessorConfig) -> IcebergResult<FileIO> {
     match &accessor_config.storage_config {
         #[cfg(feature = "storage-fs")]
-        StorageConfig::FileSystem { .. } => FileIOBuilder::new_fs_io().build(),
+        StorageConfig::FileSystem { .. } => Ok(FileIO::new_with_fs()),
         #[cfg(feature = "storage-s3")]
         StorageConfig::S3 {
             access_key_id,
@@ -110,8 +110,12 @@ pub(crate) fn create_file_io(accessor_config: &AccessorConfig) -> IcebergResult<
             endpoint,
             ..
         } => {
-            let mut file_io_builder = FileIOBuilder::new("s3")
+            let factory = iceberg_storage_opendal::OpenDalStorageFactory::S3 {
+                customized_credential_load: None,
+            };
+            let mut file_io_builder = iceberg::io::FileIOBuilder::new(std::sync::Arc::new(factory))
                 .with_prop(iceberg::io::S3_REGION, region)
+                .with_prop(iceberg::io::S3_PATH_STYLE_ACCESS, "true")
                 .with_prop(iceberg::io::S3_ACCESS_KEY_ID, access_key_id)
                 .with_prop(iceberg::io::S3_SECRET_ACCESS_KEY, secret_access_key)
                 .with_prop(iceberg::io::S3_DISABLE_CONFIG_LOAD, "true")
@@ -119,7 +123,7 @@ pub(crate) fn create_file_io(accessor_config: &AccessorConfig) -> IcebergResult<
             if let Some(endpoint) = endpoint {
                 file_io_builder = file_io_builder.with_prop(iceberg::io::S3_ENDPOINT, endpoint);
             }
-            file_io_builder.build()
+            Ok(file_io_builder.build())
         }
     }
 }

@@ -26,9 +26,8 @@ use crate::storage::table::iceberg::io_utils as iceberg_io_utils;
 use crate::storage::table::iceberg::moonlink_catalog::PuffinBlobType;
 use crate::storage::table::iceberg::puffin_utils;
 use crate::storage::table::iceberg::puffin_utils::PuffinBlobRef;
-use crate::storage::table::iceberg::puffin_writer_proxy::{
-    get_puffin_metadata_and_close, PuffinBlobMetadataProxy,
-};
+use crate::storage::table::iceberg::puffin_writer_proxy::close_and_read_puffin_metadata;
+use crate::storage::table::iceberg::puffin_writer_proxy::PuffinFileMetadata;
 use crate::storage::table::iceberg::schema_utils;
 use crate::storage::table::iceberg::utils::get_unique_hash_index_v1_filepath;
 use crate::Result;
@@ -79,7 +78,7 @@ struct SingleFileIndexImportResult {
     /// File index.
     mooncake_file_index: MooncakeFileIndex,
     /// Puffin metadata.
-    puffin_metadata: Vec<PuffinBlobMetadataProxy>,
+    puffin_metadata: PuffinFileMetadata,
     /// Puffin filepath.
     puffin_filepath: String,
 }
@@ -97,7 +96,7 @@ struct PreparedDeletionVectorBlob {
     /// Puffin file path the blob is stored.
     puffin_filepath: String,
     /// Puffin metadata for the blob.
-    puffin_metadata: Option<Vec<PuffinBlobMetadataProxy>>,
+    puffin_metadata: Option<PuffinFileMetadata>,
     /// Deleted row count.
     deleted_row_count: usize,
 }
@@ -152,7 +151,9 @@ async fn import_one_file_index(
     puffin_writer
         .add(puffin_blob, iceberg::puffin::CompressionCodec::None)
         .await?;
-    let puffin_metadata = get_puffin_metadata_and_close(puffin_writer).await?;
+    let puffin_metadata =
+        close_and_read_puffin_metadata(puffin_writer, iceberg_table.file_io(), &puffin_filepath)
+            .await?;
 
     Ok(SingleFileIndexImportResult {
         local_index_file_to_remote,
@@ -252,7 +253,7 @@ impl IcebergTableManager {
 
         // Import disk slice writer to iceberg table.
         let new_data_files_clone = new_data_files.clone();
-        let iceberg_data_files: Vec<DataFile> = stream::iter(new_data_files_clone.into_iter())
+        let iceberg_data_files: Vec<DataFile> = stream::iter(new_data_files_clone)
             .map(move |local_data_file| {
                 let iceberg_table = iceberg_table.clone();
                 let filesystem_accessor = filesystem_accessor.clone();
@@ -422,7 +423,12 @@ impl IcebergTableManager {
         )
         .await?;
         puffin_writer.add(blob, CompressionCodec::None).await?;
-        let puffin_metadata = get_puffin_metadata_and_close(puffin_writer).await?;
+        let puffin_metadata = close_and_read_puffin_metadata(
+            puffin_writer,
+            self.iceberg_table.as_ref().unwrap().file_io(),
+            &puffin_filepath,
+        )
+        .await?;
         Ok(PreparedDeletionVectorBlob {
             data_file,
             puffin_index,
@@ -627,7 +633,7 @@ impl IcebergTableManager {
         let file_indices_to_import_clone = file_indices_to_import.to_vec();
 
         let file_index_import_results: Vec<SingleFileIndexImportResult> =
-            stream::iter(file_indices_to_import_clone.into_iter())
+            stream::iter(file_indices_to_import_clone)
                 .map(move |mooncake_file_index: MooncakeFileIndex| {
                     let iceberg_table = iceberg_table;
                     let puffin_filepath = get_unique_hash_index_v1_filepath(iceberg_table);

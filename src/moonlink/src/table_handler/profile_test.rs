@@ -574,7 +574,7 @@ async fn profile_test_impl(env: TestEnvironment) {
 
     if let Ok(report) = guard.report().build() {
         let file = std::fs::File::create(profile_target_file).unwrap();
-        report.flamegraph(file).unwrap();
+        crate::profiling::write_flamegraph(&report, file).unwrap();
     }
 }
 

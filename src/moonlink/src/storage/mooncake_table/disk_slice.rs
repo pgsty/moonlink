@@ -78,7 +78,7 @@ impl FlushFailureInjector {
 
     fn take_failure(&self) -> bool {
         self.remaining_full_disk_failures
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |remaining| remaining.checked_sub(1),

@@ -581,8 +581,12 @@ impl SnapshotTableState {
         // Assert and update flush LSN.
         if let Some(new_flush_lsn) = task.new_flush_lsn {
             // Assert flush LSN doesn't regress, if not force snapshot.
-            if self.current_snapshot.flush_lsn.is_some() && !opt.force_create {
-                ma::assert_lt!(self.current_snapshot.flush_lsn.unwrap(), new_flush_lsn);
+            if let Some(previous) = self
+                .current_snapshot
+                .flush_lsn
+                .filter(|_| !opt.force_create)
+            {
+                ma::assert_lt!(previous, new_flush_lsn);
             }
             // Update flush LSN.
             self.current_snapshot.flush_lsn = Some(new_flush_lsn);
@@ -728,10 +732,7 @@ impl SnapshotTableState {
 
         // Add completed batches
         // Assert that no incoming batch ID is already present in the map.
-        for batch in streaming_batches
-            .into_iter()
-            .chain(non_streaming_batches.into_iter())
-        {
+        for batch in streaming_batches.into_iter().chain(non_streaming_batches) {
             let deletions = match batch.deletion_vector {
                 Some(dv) => dv, // Use the deletion vector from streaming transaction
                 None => BatchDeletionVector::new(batch.record_batch.num_rows()), // Create fresh deletion vector for non-streaming

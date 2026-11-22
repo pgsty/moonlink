@@ -245,7 +245,8 @@ impl IcebergTableManager {
         self.validate_schema_consistency_at_load();
 
         // Load moonlink related metadata.
-        let table_metadata = self.iceberg_table.as_ref().unwrap().metadata();
+        let table = self.iceberg_table.as_ref().unwrap().clone();
+        let table_metadata = table.metadata();
 
         // There's nothing stored in iceberg table.
         if table_metadata.current_snapshot().is_none() {
@@ -257,14 +258,8 @@ impl IcebergTableManager {
         // Load table state into iceberg table manager.
         let snapshot_meta = table_metadata.current_snapshot().unwrap();
         let snapshot_property = snapshot_utils::get_snapshot_properties(table_metadata)?;
-        let manifest_list = snapshot_meta
-            .load_manifest_list(
-                self.iceberg_table.as_ref().unwrap().file_io(),
-                table_metadata,
-            )
-            .await?;
-
-        let file_io = self.iceberg_table.as_ref().unwrap().file_io().clone();
+        let manifest_list = table.manifest_list_reader(snapshot_meta).load().await?;
+        let file_io = table.file_io().clone();
         let mut loaded_file_indices = vec![];
 
         // On load, we do two passes on all entries.
@@ -276,7 +271,7 @@ impl IcebergTableManager {
 
         // Attempt to load data files first.
         for manifest_file in manifest_list.entries().iter() {
-            let manifest = manifest_file.load_manifest(&file_io).await?;
+            let manifest = table.manifest_reader().read(manifest_file).await?;
             assert!(manifest_file_cache
                 .insert(manifest_file.manifest_path.clone(), manifest.clone())
                 .is_none());

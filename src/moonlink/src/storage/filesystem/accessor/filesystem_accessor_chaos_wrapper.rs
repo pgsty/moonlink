@@ -1,9 +1,13 @@
-/// A customized opendal layer, which provides chaos features like injected delay, intended errors, etc.
+use opendal::raw::oio::{Delete, List, Read, ReadStream, Write};
 use opendal::raw::{
-    Access, Layer, LayeredAccess, OpList, OpRead, OpWrite, RpDelete, RpList, RpRead, RpWrite,
+    oio, Layer, OpCopier, OpCopy, OpCreateDir, OpDelete, OpList, OpPresign, OpRead, OpRename,
+    OpStat, OpWrite, RpCreateDir, RpPresign, RpRead, RpRename, RpStat, Service, ServiceInfo,
+    Servicer,
 };
-use opendal::Metadata;
-use opendal::Result;
+/// A customized opendal layer, which provides chaos features like injected delay, intended errors, etc.
+use opendal::BytesRange;
+use opendal::{Buffer, Capability, Metadata, OperationContext, Result};
+use std::sync::Arc;
 
 use crate::storage::filesystem::accessor::chaos_generator::ChaosGenerator;
 use crate::storage::filesystem::accessor_config::ChaosConfig;
@@ -23,111 +27,163 @@ impl ChaosLayer {
     }
 }
 
-impl<A: Access> Layer<A> for ChaosLayer {
-    type LayeredAccess = ChaosAccessor<A>;
-
-    fn layer(&self, inner: A) -> Self::LayeredAccess {
-        ChaosAccessor {
+impl Layer for ChaosLayer {
+    fn apply_service(&self, inner: Servicer) -> Servicer {
+        Arc::new(ChaosAccessor {
             chaos_generator: self.chaos_generator.clone(),
             inner,
-        }
+        })
     }
 }
 
 #[derive(Debug)]
-pub struct ChaosAccessor<A> {
+struct ChaosAccessor {
     /// Chaos generator.
     chaos_generator: ChaosGenerator,
     /// Inner accessor.
-    inner: A,
+    inner: Servicer,
 }
 
-impl<A: Access> LayeredAccess for ChaosAccessor<A> {
-    type Inner = A;
-    type Reader = ChaosReader<A::Reader>;
-    type Writer = ChaosWriter<A::Writer>;
-    type Lister = A::Lister;
-    type Deleter = A::Deleter;
+impl Service for ChaosAccessor {
+    type Reader = ChaosIo<oio::Reader>;
+    type Writer = ChaosIo<oio::Writer>;
+    type Lister = ChaosIo<oio::Lister>;
+    type Deleter = ChaosIo<oio::Deleter>;
+    type Copier = oio::Copier;
 
-    fn inner(&self) -> &Self::Inner {
-        &self.inner
+    fn info(&self) -> ServiceInfo {
+        self.inner.info()
     }
 
-    async fn read(&self, path: &str, args: OpRead) -> Result<(RpRead, Self::Reader)> {
-        self.chaos_generator.perform_wrapper_function().await?;
-        self.inner
-            .read(path, args)
-            .await
-            .map(|(rp, r)| (rp, ChaosReader::new(r, self.chaos_generator.clone())))
+    fn capability(&self) -> Capability {
+        self.inner.capability()
     }
 
-    async fn write(&self, path: &str, args: OpWrite) -> Result<(RpWrite, Self::Writer)> {
-        self.chaos_generator.perform_wrapper_function().await?;
-        self.inner
-            .write(path, args)
-            .await
-            .map(|(rp, w)| (rp, ChaosWriter::new(w, self.chaos_generator.clone())))
+    fn read(&self, ctx: &OperationContext, path: &str, args: OpRead) -> Result<Self::Reader> {
+        Ok(ChaosIo::new(
+            self.inner.read(ctx, path, args)?,
+            &self.chaos_generator,
+        ))
     }
 
-    async fn list(&self, path: &str, args: OpList) -> Result<(RpList, Self::Lister)> {
-        self.chaos_generator.perform_wrapper_function().await?;
-        self.inner.list(path, args).await
+    fn write(&self, ctx: &OperationContext, path: &str, args: OpWrite) -> Result<Self::Writer> {
+        Ok(ChaosIo::new(
+            self.inner.write(ctx, path, args)?,
+            &self.chaos_generator,
+        ))
     }
 
-    async fn delete(&self) -> Result<(RpDelete, Self::Deleter)> {
-        self.chaos_generator.perform_wrapper_function().await?;
-        self.inner.delete().await
+    fn list(&self, ctx: &OperationContext, path: &str, args: OpList) -> Result<Self::Lister> {
+        Ok(ChaosIo::new(
+            self.inner.list(ctx, path, args)?,
+            &self.chaos_generator,
+        ))
+    }
+
+    fn delete(&self, ctx: &OperationContext) -> Result<Self::Deleter> {
+        Ok(ChaosIo::new(self.inner.delete(ctx)?, &self.chaos_generator))
+    }
+
+    fn copy(
+        &self,
+        ctx: &OperationContext,
+        from: &str,
+        to: &str,
+        args: OpCopy,
+        opts: OpCopier,
+    ) -> Result<Self::Copier> {
+        self.inner.copy(ctx, from, to, args, opts)
+    }
+
+    async fn create_dir(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpCreateDir,
+    ) -> Result<RpCreateDir> {
+        self.inner.create_dir(ctx, path, args).await
+    }
+
+    async fn rename(
+        &self,
+        ctx: &OperationContext,
+        from: &str,
+        to: &str,
+        args: OpRename,
+    ) -> Result<RpRename> {
+        self.inner.rename(ctx, from, to, args).await
+    }
+
+    async fn stat(&self, ctx: &OperationContext, path: &str, args: OpStat) -> Result<RpStat> {
+        self.inner.stat(ctx, path, args).await
+    }
+
+    async fn presign(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpPresign,
+    ) -> Result<RpPresign> {
+        self.inner.presign(ctx, path, args).await
     }
 }
 
-/// ==========================
-/// Chaos reader
-/// ==========================
-///
-pub struct ChaosReader<R> {
-    /// Chaos generator.
+struct ChaosIo<Inner> {
     chaos_generator: ChaosGenerator,
-    /// Inner reader.
-    inner: R,
+    inner: Inner,
 }
 
-impl<R> ChaosReader<R> {
-    fn new(inner: R, chaos_generator: ChaosGenerator) -> Self {
+impl<Inner> ChaosIo<Inner> {
+    fn new(inner: Inner, chaos_generator: &ChaosGenerator) -> Self {
         Self {
-            chaos_generator,
+            chaos_generator: chaos_generator.clone(),
             inner,
         }
     }
 }
 
-impl<R: opendal::raw::oio::Read> opendal::raw::oio::Read for ChaosReader<R> {
-    async fn read(&mut self) -> Result<opendal::Buffer> {
+impl Read for ChaosIo<oio::Reader> {
+    async fn open(&self, range: BytesRange) -> Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+        self.chaos_generator.perform_wrapper_function().await?;
+        let (result, stream) = self.inner.open(range).await?;
+        Ok((
+            result,
+            Box::new(ChaosIo::new(stream, &self.chaos_generator)),
+        ))
+    }
+
+    async fn read(&self, range: BytesRange) -> Result<(RpRead, Buffer)> {
+        self.chaos_generator.perform_wrapper_function().await?;
+        self.inner.read(range).await
+    }
+}
+
+impl ReadStream for ChaosIo<Box<dyn oio::ReadStreamDyn>> {
+    async fn read(&mut self) -> Result<Buffer> {
         self.chaos_generator.perform_wrapper_function().await?;
         self.inner.read().await
     }
 }
 
-/// ==========================
-/// Chaos writer
-/// ==========================
-///
-pub struct ChaosWriter<W> {
-    /// Chaos generator.
-    chaos_generator: ChaosGenerator,
-    /// Inner writer.
-    inner: W,
-}
-
-impl<W> ChaosWriter<W> {
-    fn new(inner: W, chaos_generator: ChaosGenerator) -> Self {
-        Self {
-            chaos_generator,
-            inner,
-        }
+impl List for ChaosIo<oio::Lister> {
+    async fn next(&mut self) -> Result<Option<oio::Entry>> {
+        self.chaos_generator.perform_wrapper_function().await?;
+        self.inner.next().await
     }
 }
 
-impl<W: opendal::raw::oio::Write> opendal::raw::oio::Write for ChaosWriter<W> {
+impl Delete for ChaosIo<oio::Deleter> {
+    async fn delete(&mut self, path: &str, args: OpDelete) -> Result<()> {
+        self.chaos_generator.perform_wrapper_function().await?;
+        self.inner.delete(path, args).await
+    }
+
+    async fn close(&mut self) -> Result<()> {
+        self.inner.close().await
+    }
+}
+
+impl Write for ChaosIo<oio::Writer> {
     async fn write(&mut self, bs: opendal::Buffer) -> Result<()> {
         self.chaos_generator.perform_wrapper_function().await?;
         self.inner.write(bs).await

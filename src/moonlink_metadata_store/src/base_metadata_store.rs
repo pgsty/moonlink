@@ -28,6 +28,10 @@ pub struct TableMetadataEntry {
 
 #[async_trait]
 pub trait MetadataStoreTrait: Send + Sync {
+    async fn registration(&self, database: &str, table: &str) -> Result<Option<String>>;
+    async fn registered_databases(&self) -> Result<Vec<String>>;
+    async fn managed_registrations(&self, database: &str) -> Result<Vec<(String, String)>>;
+
     /// Return whether metadata table exists.
     #[allow(async_fn_in_trait)]
     async fn metadata_table_exists(&self) -> Result<bool>;
@@ -59,6 +63,7 @@ pub trait MetadataStoreTrait: Send + Sync {
         src_table_name: &str,
         src_uri: &str,
         moonlink_table_config: MoonlinkTableConfig,
+        generation: &str,
     ) -> Result<()>;
 
     /// Delete table config for the given table.

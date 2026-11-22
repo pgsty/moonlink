@@ -10,6 +10,7 @@
 
 use crate::rpc_server::encode_table_schema;
 use arrow_ipc::reader::StreamReader;
+use arrow_schema::{DataType, Field};
 use moonlink_connectors::pg_replicate::table::{ColumnSchema, LookupKey, TableName, TableSchema};
 use moonlink_connectors::pg_replicate::util::postgres_schema_to_moonlink_schema;
 use tokio_postgres::types::{Field as PgField, Kind, Type};
@@ -97,6 +98,29 @@ fn test_get_table_schema_ipc_golden() {
     assert_eq!(actual, SCHEMA_GOLDEN, "GetTableSchema IPC stream drift");
 }
 
+fn describe_field(field: &Field) -> String {
+    let kind = match field.data_type() {
+        DataType::List(item) => format!("List({})", describe_field(item)),
+        DataType::Struct(fields) => {
+            let members: Vec<_> = fields.iter().map(|member| describe_field(member)).collect();
+            format!("Struct({})", members.join(", "))
+        }
+        primitive => format!("{primitive:?}"),
+    };
+    let mut metadata: Vec<_> = field
+        .metadata()
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    metadata.sort();
+    format!(
+        "{} {kind} nullable={} [{}]",
+        field.name(),
+        field.is_nullable(),
+        metadata.join(", ")
+    )
+}
+
 /// (column name, Arrow data type, nullable, sorted field metadata) for every mapped Postgres type,
 /// decoded back from the IPC stream the server sends.
 #[test]
@@ -133,21 +157,7 @@ fn test_get_table_schema_type_mapping() {
     let actual: Vec<String> = decoded
         .fields()
         .iter()
-        .map(|f| {
-            let mut metadata: Vec<String> = f
-                .metadata()
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect();
-            metadata.sort();
-            format!(
-                "{} {:?} nullable={} [{}]",
-                f.name(),
-                f.data_type(),
-                f.is_nullable(),
-                metadata.join(", ")
-            )
-        })
+        .map(|field| describe_field(field))
         .collect();
     if std::env::var_os("WIRE_GOLDEN_PRINT").is_some() {
         println!("MAPPING_BEGIN\n{}\nMAPPING_END", actual.join("\n"));
@@ -181,11 +191,11 @@ const EXPECTED_MAPPING: &str = r#"
     c_bytea Binary nullable=true [PARQUET:field_id=18]
     c_oid Int64 nullable=true [PARQUET:field_id=19]
     c_inet_fallback Utf8 nullable=true [PARQUET:field_id=20]
-    c_int4_array List(Field { name: "item", data_type: Int32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "21"} }) nullable=true [PARQUET:field_id=22]
-    c_text_array List(Field { name: "item", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "23"} }) nullable=true [PARQUET:field_id=24]
+    c_int4_array List(item Int32 nullable=true [PARQUET:field_id=21]) nullable=true [PARQUET:field_id=22]
+    c_text_array List(item Utf8 nullable=true [PARQUET:field_id=23]) nullable=true [PARQUET:field_id=24]
     c_uuid FixedSizeBinary(16) nullable=true [ARROW:extension:name=arrow.uuid, PARQUET:field_id=25]
     c_json Utf8 nullable=true [ARROW:extension:metadata=, ARROW:extension:name=arrow.json, PARQUET:field_id=26]
     c_jsonb Utf8 nullable=true [ARROW:extension:metadata=, ARROW:extension:name=arrow.json, PARQUET:field_id=27]
     c_enum Utf8 nullable=true [PARQUET:field_id=28]
-    c_composite Struct([Field { name: "x", data_type: Int32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "29"} }, Field { name: "y", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {"PARQUET:field_id": "30"} }]) nullable=true [PARQUET:field_id=31]
+    c_composite Struct(x Int32 nullable=true [PARQUET:field_id=29], y Float64 nullable=true [PARQUET:field_id=30]) nullable=true [PARQUET:field_id=31]
 "#;

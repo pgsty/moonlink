@@ -237,22 +237,15 @@ impl ColumnStoreBuffer {
         offset: usize,
         identity: &IdentityProp,
     ) -> bool {
-        if record.row_identity.is_some() && identity.requires_identity_check_in_mem_slice() {
-            if let Some(batch) = &batch.data {
-                record
-                    .row_identity
-                    .as_ref()
-                    .unwrap()
-                    .equals_record_batch_at_offset(batch, offset, identity)
-            } else {
-                record
-                    .row_identity
-                    .as_ref()
-                    .unwrap()
-                    .equals_moonlink_row(self.current_rows.get_row(offset), identity)
-            }
-        } else {
-            true
+        let Some(row_identity) = &record.row_identity else {
+            return true;
+        };
+        if !identity.requires_identity_check_in_mem_slice() {
+            return true;
+        }
+        match &batch.data {
+            Some(batch) => row_identity.equals_record_batch_at_offset(batch, offset, identity),
+            None => row_identity.equals_moonlink_row(self.current_rows.get_row(offset), identity),
         }
     }
 

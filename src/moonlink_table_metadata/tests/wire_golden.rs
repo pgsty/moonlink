@@ -61,8 +61,11 @@ fn test_scan_payload_wire_format() {
 
     // The fixed-width header is what the C++ side indexes into; spell it out independently.
     let words: Vec<u32> = bytes[..4 * EXPECTED_HEADER_WORDS.len()]
-        .chunks_exact(4)
-        .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .copied()
+        .map(u32::from_ne_bytes)
         .collect();
     assert_eq!(words, EXPECTED_HEADER_WORDS);
     assert_eq!(bytes.len(), 4 * 17 + 29 * 2 + 26);

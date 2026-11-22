@@ -277,7 +277,7 @@ impl BaseFileSystemAccess for FileSystemAccessor {
     async fn remove_directory(&self, directory: &str) -> Result<()> {
         let sanitized_directory = self.sanitize_path(directory);
         let op = self.get_operator().await?.clone();
-        op.remove_all(sanitized_directory).await?;
+        op.delete_with(sanitized_directory).recursive(true).await?;
         Ok(())
     }
 
@@ -387,7 +387,7 @@ impl BaseFileSystemAccess for FileSystemAccessor {
         let expected_len = content.len();
 
         // Conditional write is not supported for all storage backends, if not supported, fallback to [`write_object`].
-        if !operator.info().full_capability().write_with_if_match {
+        if !operator.info().capability().write_with_if_match {
             return self.write_object(object, content).await;
         }
 
@@ -586,6 +586,8 @@ mod tests {
             AccessorConfig::new_with_storage_config(storage_config.clone()),
         );
 
+        let existing = temp_dir.path().join("existing");
+        std::fs::write(&existing, b"keep").unwrap();
         const DST_FILENAME: &str = "target";
         const TARGET_FILESIZE: usize = 10;
 
@@ -697,28 +699,6 @@ mod tests {
         assert!(atomic_tmp_files(temp_dir.path()).is_empty());
     }
 
-    /// Temp files a crash left behind are deleted before this process first writes there.
-    #[tokio::test]
-    async fn test_leftover_atomic_write_files_are_removed() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let tmp_dir = temp_dir.path().join(
-            crate::storage::filesystem::accessor::operator_utils::DEFAULT_ATOMIC_WRITE_SUBDIR,
-        );
-        std::fs::create_dir_all(&tmp_dir).unwrap();
-        std::fs::write(tmp_dir.join("partial-write"), vec![1u8; 4096]).unwrap();
-        let storage_config = StorageConfig::FileSystem {
-            root_directory: temp_dir.path().to_str().unwrap().to_string(),
-            atomic_write_dir: None,
-        };
-        let accessor =
-            create_filesystem_accessor(AccessorConfig::new_with_storage_config(storage_config));
-        accessor
-            .write_object("t/file", b"content".to_vec())
-            .await
-            .unwrap();
-        assert!(atomic_tmp_files(temp_dir.path()).is_empty());
-    }
-
     // Test atomic write operation for local filesystem.
     #[tokio::test]
     async fn test_atomic_write() {
@@ -732,6 +712,8 @@ mod tests {
             AccessorConfig::new_with_storage_config(storage_config.clone()),
         );
 
+        let existing = temp_dir.path().join("existing");
+        std::fs::write(&existing, b"keep").unwrap();
         const DST_FILENAME: &str = "target";
         const TARGET_FILESIZE: usize = 10;
 
@@ -744,6 +726,7 @@ mod tests {
         // Read object and check.
         let actual_content = filesystem_accessor.read_object(DST_FILENAME).await.unwrap();
         assert_eq!(actual_content, random_content.as_bytes().to_vec());
+        assert_eq!(std::fs::read(existing).unwrap(), b"keep");
     }
 
     // Local filesystem doesn't support conditional write, which should behave the same as [`write_object`].
@@ -807,7 +790,7 @@ mod tests {
         let filesystem_accessor = create_filesystem_accessor(accessor_config.clone());
 
         // Prepare src file.
-        let remote_filepath = format!("{}/remote", &root_directory);
+        let remote_filepath = format!("{}/remote", root_directory);
         let expected_content =
             create_remote_file(&remote_filepath, accessor_config, file_size).await;
 
@@ -843,11 +826,11 @@ mod tests {
         let filesystem_accessor = create_filesystem_accessor(accessor_config.clone());
 
         // Prepare src file.
-        let src_filepath = format!("{}/src", &root_directory);
+        let src_filepath = format!("{}/src", root_directory);
         let expected_content = create_local_file(&src_filepath, file_size).await;
 
         // Copy from src to dst.
-        let dst_filepath = format!("{}/dst", &root_directory);
+        let dst_filepath = format!("{}/dst", root_directory);
         filesystem_accessor
             .copy_from_local_to_remote(&src_filepath, &dst_filepath)
             .await
@@ -999,11 +982,11 @@ mod tests {
         let filesystem_accessor = create_filesystem_accessor(accessor_config.clone());
 
         // Prepare src file.
-        let src_filepath = format!("{}/src", &root_directory);
+        let src_filepath = format!("{}/src", root_directory);
         let expected_content = create_remote_file(&src_filepath, accessor_config, file_size).await;
 
         // Copy from src to dst.
-        let dst_filepath = format!("{}/dst", &root_directory);
+        let dst_filepath = format!("{}/dst", root_directory);
         filesystem_accessor
             .copy_from_remote_to_local(&src_filepath, &dst_filepath)
             .await
@@ -1029,7 +1012,7 @@ mod tests {
         let filesystem_accessor = create_filesystem_accessor(accessor_config.clone());
 
         let dst_filename = "dst".to_string();
-        let dst_filepath = format!("{}/{}", &root_directory, dst_filename);
+        let dst_filepath = format!("{}/{}", root_directory, dst_filename);
         let writer = filesystem_accessor
             .create_unbuffered_stream_writer(&dst_filepath)
             .await

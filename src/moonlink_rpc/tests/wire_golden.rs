@@ -85,6 +85,11 @@ fn request_label(request: &Request) -> &'static str {
         Request::OptimizeTable { .. } => "7 OptimizeTable",
         Request::ScanTableBegin { .. } => "8 ScanTableBegin",
         Request::ScanTableEnd { .. } => "9 ScanTableEnd",
+        Request::Registration { .. } => "10 Registration",
+        Request::DropRegistration { .. } => "11 DropRegistration",
+        Request::RegisteredDatabases {} => "12 RegisteredDatabases",
+        Request::CreateRegisteredTable { .. } => "13 CreateRegisteredTable",
+        Request::ManagedRegistrations { .. } => "14 ManagedRegistrations",
     }
 }
 
@@ -161,6 +166,38 @@ fn sample_requests() -> Vec<(&'static str, Request)> {
                 table: s(TABLE),
             },
         ),
+        (
+            "10 Registration",
+            Request::Registration {
+                database: s(DATABASE),
+                table: s(TABLE),
+            },
+        ),
+        (
+            "11 DropRegistration",
+            Request::DropRegistration {
+                database: s(DATABASE),
+                table: s(TABLE),
+                generation: s("old"),
+            },
+        ),
+        ("12 RegisteredDatabases", Request::RegisteredDatabases {}),
+        (
+            "13 CreateRegisteredTable",
+            Request::CreateRegisteredTable {
+                database: s(DATABASE),
+                table: s(TABLE),
+                src: s("s"),
+                src_uri: s("u"),
+                table_config: s("{}"),
+            },
+        ),
+        (
+            "14 ManagedRegistrations",
+            Request::ManagedRegistrations {
+                database: s(DATABASE),
+            },
+        ),
     ]
 }
 
@@ -175,6 +212,11 @@ const REQUEST_GOLDENS: &[(&str, &str)] = &[
     ("7 OptimizeTable", "1d0000000708706f7374677265730d7075626c69632e6f72646572730466756c6c"),
     ("8 ScanTableBegin", "210000000808706f7374677265730d7075626c69632e6f7264657273fd280f3a6b01000000"),
     ("9 ScanTableEnd", "180000000908706f7374677265730d7075626c69632e6f7264657273"),
+    ("10 Registration", "180000000a08706f7374677265730d7075626c69632e6f7264657273"),
+    ("11 DropRegistration", "1c0000000b08706f7374677265730d7075626c69632e6f7264657273036f6c64"),
+    ("12 RegisteredDatabases", "010000000c"),
+    ("13 CreateRegisteredTable", "1f0000000d08706f7374677265730d7075626c69632e6f726465727301730175027b7d"),
+    ("14 ManagedRegistrations", "0a0000000e08706f737467726573"),
 ];
 
 #[tokio::test]

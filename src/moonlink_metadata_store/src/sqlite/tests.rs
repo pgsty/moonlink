@@ -110,6 +110,7 @@ async fn test_metadata_table_exists() {
             SRC_TABLE_NAME,
             SRC_TABLE_URI,
             moonlink_table_config.clone(),
+            "pg-test",
         )
         .await
         .unwrap();
@@ -136,6 +137,7 @@ async fn test_table_metadata_store_and_load() {
             SRC_TABLE_NAME,
             SRC_TABLE_URI,
             moonlink_table_config.clone(),
+            "pg-test",
         )
         .await
         .unwrap();
@@ -161,6 +163,7 @@ async fn test_table_metadata_store_and_load_s3() {
             SRC_TABLE_NAME,
             SRC_TABLE_URI,
             moonlink_table_config.clone(),
+            "pg-test",
         )
         .await
         .unwrap();
@@ -190,6 +193,7 @@ async fn test_table_metadata_store_for_duplicate_tables() {
             SRC_TABLE_NAME,
             SRC_TABLE_URI,
             moonlink_table_config.clone(),
+            "pg-test",
         )
         .await
         .unwrap();
@@ -202,6 +206,7 @@ async fn test_table_metadata_store_for_duplicate_tables() {
             SRC_TABLE_NAME,
             SRC_TABLE_URI,
             moonlink_table_config.clone(),
+            "pg-test",
         )
         .await;
     assert!(res.is_err());
@@ -236,6 +241,7 @@ async fn test_delete_table_metadata_store() {
             SRC_TABLE_NAME,
             SRC_TABLE_URI,
             moonlink_table_config.clone(),
+            "pg-test",
         )
         .await
         .unwrap();

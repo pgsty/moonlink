@@ -9,7 +9,7 @@ use moonlink_backend::MoonlinkBackend;
 use moonlink_metadata_store::SqliteMetadataStore;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{error, info};
+use tracing::info;
 
 #[derive(Debug)]
 pub struct ServiceConfig {
@@ -36,20 +36,13 @@ pub async fn start_with_config(config: ServiceConfig) -> Result<()> {
 
     // Start RPC server on Unix socket
     let socket_path = std::path::PathBuf::from(&config.base_path).join("moonlink.sock");
-    let rpc_handle = tokio::spawn(async move {
-        if let Err(e) = rpc_server::start_unix_server(backend, socket_path).await {
-            error!("RPC server failed: {}", e);
+    tokio::select! {
+        result = rpc_server::start_unix_server(backend, socket_path) => result,
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM, shutting down...");
+            Ok(())
         }
-    });
-    info!("Moonlink service started successfully");
-
-    // Wait for termination signal
-    let _ = sigterm.recv().await;
-    info!("Received SIGTERM, shutting down...");
-    rpc_handle.abort();
-
-    info!("Moonlink service shut down complete");
-    Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use crate::storage::mooncake_table::table_creation_test_utils::*;
 use crate::storage::storage_utils::{MooncakeDataFileRef, TableId, TableUniqueFileId};
 use crate::{create_data_file, FileSystemAccessor};
 use arrow_array::{Int32Array, RecordBatch, StringArray};
-use parquet::file::properties::DEFAULT_MAX_ROW_GROUP_SIZE;
+use parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT;
 use std::sync::Arc;
 
 /// Write `num_rows` narrow rows to a new data file and build its file index.
@@ -57,7 +57,7 @@ async fn test_compacted_file_closes_after_a_full_row_group() {
     // The first input fills exactly one row group, so after it the writer holds no rows in
     // progress, only the row group already written.
     let (large, large_index) =
-        data_file_with_index(temp_dir.path(), 0, DEFAULT_MAX_ROW_GROUP_SIZE).await;
+        data_file_with_index(temp_dir.path(), 0, DEFAULT_MAX_ROW_GROUP_ROW_COUNT).await;
     let (small, small_index) = data_file_with_index(temp_dir.path(), 1, 10).await;
 
     let payload = DataCompactionPayload {
@@ -95,5 +95,5 @@ async fn test_compacted_file_closes_after_a_full_row_group() {
         .map(|(_, entry)| entry.num_rows)
         .collect();
     rows_per_file.sort();
-    assert_eq!(rows_per_file, vec![10, DEFAULT_MAX_ROW_GROUP_SIZE]);
+    assert_eq!(rows_per_file, vec![10, DEFAULT_MAX_ROW_GROUP_ROW_COUNT]);
 }

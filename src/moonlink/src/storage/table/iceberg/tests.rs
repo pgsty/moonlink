@@ -2109,7 +2109,7 @@ async fn test_small_batch_size_and_large_parquet_size() {
         append_only: false,
         batch_size: 1,
         disk_slice_writer_config: DiskSliceWriterConfig {
-            parquet_file_size: 1000,
+            parquet_file_size: usize::MAX,
             chaos_config: None,
         },
         // Trigger iceberg snapshot as long as there're any commit deletion log.
@@ -2253,7 +2253,7 @@ async fn test_multiple_table_ids_for_deletion_vector() {
 
     // Check deletion vector puffin files' file id.
     assert_eq!(snapshot.disk_files.len() as u64, target_data_files_num);
-    for (_, cur_disk_file_entry) in snapshot.disk_files.iter() {
+    for cur_disk_file_entry in snapshot.disk_files.values() {
         assert!(cur_disk_file_entry.puffin_deletion_blob.is_some());
     }
 }
@@ -2426,7 +2426,7 @@ async fn test_async_iceberg_snapshot_impl(iceberg_table_config: IcebergTableConf
 
     // Find the key-value pair, which correspond to old snapshot's only key.
     let mut old_data_file: Option<MooncakeDataFileRef> = None;
-    for (cur_data_file, _) in snapshot.disk_files.iter() {
+    for cur_data_file in snapshot.disk_files.keys() {
         if cur_data_file.file_path() == data_file_1.file_path() {
             old_data_file = Some(cur_data_file.clone());
             break;

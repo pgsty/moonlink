@@ -13,7 +13,7 @@ impl SnapshotTableState {
         let mut evicted_files_to_delete = vec![];
 
         // Unreference and delete data files and puffin files.
-        for (_, disk_file_entry) in self.current_snapshot.disk_files.iter_mut() {
+        for disk_file_entry in self.current_snapshot.disk_files.values_mut() {
             // Handle data files.
             let cache_handle = &mut disk_file_entry.cache_handle;
             if let Some(cache_handle) = cache_handle {

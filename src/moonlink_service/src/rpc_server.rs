@@ -298,6 +298,51 @@ where
 
                 write(&mut stream, &res).await?;
             }
+            Request::Registration { database, table } => {
+                let result = backend
+                    .registration(&database, &table)
+                    .await
+                    .map_err(into_error_struct);
+                write(&mut stream, &result).await?;
+            }
+            Request::DropRegistration {
+                database,
+                table,
+                generation,
+            } => {
+                let result = backend
+                    .drop_current(database, table, Some(&generation))
+                    .await
+                    .map_err(into_error_struct);
+                write(&mut stream, &result).await?;
+            }
+            Request::CreateRegisteredTable {
+                database,
+                table,
+                src,
+                src_uri,
+                table_config,
+            } => {
+                let result = backend
+                    .create_with_registration(database, table, src, src_uri, table_config, true)
+                    .await
+                    .map_err(into_error_struct);
+                write(&mut stream, &result).await?;
+            }
+            Request::ManagedRegistrations { database } => {
+                let result = backend
+                    .managed_registrations(&database)
+                    .await
+                    .map_err(into_error_struct);
+                write(&mut stream, &result).await?;
+            }
+            Request::RegisteredDatabases {} => {
+                let result = backend
+                    .registered_databases()
+                    .await
+                    .map_err(into_error_struct);
+                write(&mut stream, &result).await?;
+            }
             // Kept for wire compatibility; no client uses it.
             Request::GetParquetMetadatas { .. } => {
                 let res: RpcResult<GetParquetMetadatasResponse> =

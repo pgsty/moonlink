@@ -132,7 +132,7 @@ async fn test_copy_from_local_to_remote(#[case] file_size: usize) {
     // Prepare src file.
     let temp_dir = tempfile::tempdir().unwrap();
     let root_directory = temp_dir.path().to_str().unwrap().to_string();
-    let src_filepath = format!("{}/src", &root_directory);
+    let src_filepath = format!("{}/src", root_directory);
     let expected_content = create_local_file(&src_filepath, file_size).await;
 
     let (bucket, warehouse_uri) = get_test_s3_bucket_and_warehouse();
@@ -162,7 +162,7 @@ async fn test_copy_from_local_to_remote(#[case] file_size: usize) {
 async fn test_copy_from_remote_to_local(#[case] file_size: usize) {
     let temp_dir = tempfile::tempdir().unwrap();
     let root_directory = temp_dir.path().to_str().unwrap().to_string();
-    let dst_filepath = format!("{}/dst", &root_directory);
+    let dst_filepath = format!("{}/dst", root_directory);
 
     let (bucket, warehouse_uri) = get_test_s3_bucket_and_warehouse();
     let _test_guard = TestGuard::new(bucket.clone()).await;
@@ -209,7 +209,7 @@ async fn test_unbuffered_stream_write_with_filesystem_accessor() {
     let filesystem_accessor = create_filesystem_accessor(s3_storage_config.clone());
 
     let dst_filename = "dst".to_string();
-    let dst_filepath = format!("{}/{}", &warehouse_uri, dst_filename);
+    let dst_filepath = format!("{}/{}", warehouse_uri, dst_filename);
     let writer = filesystem_accessor
         .create_unbuffered_stream_writer(&dst_filepath)
         .await

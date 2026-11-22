@@ -27,8 +27,11 @@ pub(crate) static S3_TEST_BUCKET_PREFIX: &str = "test-minio-warehouse-";
 pub(crate) static S3_TEST_WAREHOUSE_URI_PREFIX: &str = "s3://test-minio-warehouse-";
 pub(crate) static S3_TEST_ACCESS_KEY_ID: &str = "minioadmin";
 pub(crate) static S3_TEST_SECRET_ACCESS_KEY: &str = "minioadmin";
-pub(crate) static S3_TEST_ENDPOINT: &str = "http://s3.local:9000";
 pub(crate) static S3_TEST_REGION: &str = "us-east-1";
+
+fn test_endpoint() -> String {
+    std::env::var("MOONLINK_TEST_S3_ENDPOINT").unwrap_or_else(|_| "http://s3.local:9000".into())
+}
 
 /// Create a S3 catalog config.
 pub(crate) fn create_s3_storage_config(warehouse_uri: &str) -> AccessorConfig {
@@ -38,7 +41,7 @@ pub(crate) fn create_s3_storage_config(warehouse_uri: &str) -> AccessorConfig {
         secret_access_key: S3_TEST_SECRET_ACCESS_KEY.to_string(),
         region: S3_TEST_REGION.to_string(), // minio doesn't care about region.
         bucket: bucket.to_string(),
-        endpoint: Some(S3_TEST_ENDPOINT.to_string()),
+        endpoint: Some(test_endpoint()),
     };
     AccessorConfig::new_with_storage_config(storage_config)
 }
@@ -56,7 +59,7 @@ async fn create_test_s3_bucket_impl(bucket: Arc<String>) -> IcebergResult<()> {
     let signature = base64.encode(mac.finalize().into_bytes());
 
     let auth_header = format!("AWS {S3_TEST_ACCESS_KEY_ID}:{signature}");
-    let url = format!("{S3_TEST_ENDPOINT}/{bucket}");
+    let url = format!("{}/{bucket}", test_endpoint());
     let client = reqwest::Client::new();
 
     client
@@ -100,7 +103,7 @@ async fn delete_test_s3_bucket_impl(bucket: Arc<String>) -> IcebergResult<()> {
     let signature = base64.encode(mac.finalize().into_bytes());
 
     let auth_header = format!("AWS {S3_TEST_ACCESS_KEY_ID}:{signature}");
-    let url = format!("{S3_TEST_ENDPOINT}/{bucket}");
+    let url = format!("{}/{bucket}", test_endpoint());
     let client = reqwest::Client::new();
 
     client

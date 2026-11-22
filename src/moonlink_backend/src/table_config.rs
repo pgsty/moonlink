@@ -54,7 +54,7 @@ impl MooncakeConfig {
         if !self.is_valid() {
             return Err(Error::invalid_config(format!(
                 "Invalid config for {:?}",
-                &self
+                self
             )));
         }
 
@@ -131,10 +131,17 @@ impl TableConfig {
         temp_files_dir: String,
         mooncake_table_id: &MooncakeTableId,
     ) -> Result<MoonlinkTableConfig> {
+        if !MooncakeTableId::safe_namespace(&mooncake_table_id.database)
+            || !MooncakeTableId::safe_table_name(&mooncake_table_id.table)
+        {
+            return Err(Error::invalid_config(
+                "unsupported Iceberg namespace or table path component".into(),
+            ));
+        }
         if !self.is_valid() {
             return Err(Error::invalid_config(format!(
                 "Invalid config for {:?}",
-                &self
+                self
             )));
         }
 

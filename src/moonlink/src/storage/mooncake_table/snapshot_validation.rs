@@ -14,16 +14,16 @@ impl SnapshotTableState {
         opt: &SnapshotOption,
     ) {
         if let Some(new_flush_lsn) = task.new_flush_lsn {
-            if self.current_snapshot.flush_lsn.is_some() {
+            if let Some(previous) = self.current_snapshot.flush_lsn {
                 // Invariant-1: flush LSN doesn't regress.
                 //
                 // Force snapshot not change table states, it's possible to use the latest flush LSN.
                 if opt.force_create {
-                    ma::assert_le!(self.current_snapshot.flush_lsn.unwrap(), new_flush_lsn);
+                    ma::assert_le!(previous, new_flush_lsn);
                 }
                 // Otherwise, flush LSN always progresses.
                 else {
-                    ma::assert_lt!(self.current_snapshot.flush_lsn.unwrap(), new_flush_lsn);
+                    ma::assert_lt!(previous, new_flush_lsn);
                 }
 
                 // Invariant-2: flush must follow a commit, but commit doesn't need to be followed by a flush.
@@ -75,7 +75,7 @@ impl SnapshotTableState {
     /// Util function to validate deleted rows for batch deletion vector and puffin deletion vector blob.
     #[cfg(any(test, debug_assertions))]
     fn assert_deletion_records_for_disk_files(&self) {
-        for (_, cur_disk_file_entry) in self.current_snapshot.disk_files.iter() {
+        for cur_disk_file_entry in self.current_snapshot.disk_files.values() {
             // Puffin blob is a subset of batch deletion vector.
             ma::assert_le!(
                 cur_disk_file_entry
@@ -102,7 +102,7 @@ impl SnapshotTableState {
 
         let mut all_data_files_1 = HashSet::new();
         let mut all_data_files_2 = HashSet::new();
-        for (cur_data_file, _) in self.current_snapshot.disk_files.iter() {
+        for cur_data_file in self.current_snapshot.disk_files.keys() {
             all_data_files_1.insert(cur_data_file.file_id());
         }
         for cur_file_index in self.current_snapshot.indices.file_indices.iter() {

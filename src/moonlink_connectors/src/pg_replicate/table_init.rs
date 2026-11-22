@@ -74,7 +74,7 @@ async fn recreate_directory(dir: &PathBuf) -> Result<()> {
 
 /// Build all components needed to replicate `table_schema`.
 pub async fn build_table_components(
-    mooncake_table_id: String,
+    mooncake_table_id: &moonlink::MooncakeTableId,
     arrow_schema: ArrowSchema,
     src_table_name: String,
     src_table_id: SrcTableId,
@@ -83,7 +83,7 @@ pub async fn build_table_components(
     table_components: TableComponents,
 ) -> Result<TableResources> {
     // Recreate write-through cache directory.
-    let write_cache_path = PathBuf::from(base_path).join(&mooncake_table_id);
+    let write_cache_path = mooncake_table_id.cache_path(Path::new(base_path));
     recreate_directory(&write_cache_path).await?;
     // Make sure temporary directory exists.
     let temp_files_directory = &table_components
@@ -101,7 +101,7 @@ pub async fn build_table_components(
 
     let table = MooncakeTable::new(
         arrow_schema,
-        mooncake_table_id,
+        mooncake_table_id.to_string(),
         get_next_table_id(),
         write_cache_path,
         table_components
@@ -221,7 +221,10 @@ mod tests {
             )]))]);
         let replication_state = ReplicationState::new();
         let resources = build_table_components(
-            "db.t".to_string(),
+            &moonlink::MooncakeTableId {
+                database: "db".into(),
+                table: "t".into(),
+            },
             schema,
             "public.t".to_string(),
             1,

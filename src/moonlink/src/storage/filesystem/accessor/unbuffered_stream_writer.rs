@@ -44,7 +44,9 @@ impl UnbufferedStreamWriter {
 #[async_trait]
 impl BaseUnbufferedStreamWriter for UnbufferedStreamWriter {
     async fn append_non_blocking(&mut self, data: Vec<u8>) -> Result<()> {
-        self.request_tx.send(data).await.unwrap();
+        self.request_tx.send(data).await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "storage writer stopped")
+        })?;
         Ok(())
     }
 

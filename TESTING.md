@@ -113,16 +113,12 @@ Measured on 8 vCPU / 64 GB with mold. Most of the cold time is compilation. In `
 
 ## Not covered by `scripts/test.sh`
 
-Feature-gated suites that need external services, which CI starts as containers. Run them by hand where the
-feature still exists in your checkout. Add the hostnames to `/etc/hosts` and start the containers as in
-`.github/workflows/ci.yml`.
+Start the service before running its feature-gated suite. Set `MOONLINK_TEST_S3_ENDPOINT`
+to point the S3 tests at a local MinIO instance on another address or port.
 
 | Feature | Service | Commands |
 |---|---|---|
-| `storage-s3` | MinIO at `s3.local:9000` (`minioadmin`/`minioadmin`) | `cargo test --lib --features=storage-s3`; `cargo test test_s3_chaos --features=chaos-test,storage-s3 -p moonlink` |
-| `storage-gcs` | fake-gcs-server at `gcs.local:4443` | `cargo test --lib --features=storage-gcs`; `cargo test test_gcs_chaos --features=chaos-test,storage-gcs -p moonlink` |
-| `catalog-rest` | Iceberg REST fixture at `iceberg-rest.local:8181` | `cargo test --lib --features=catalog-rest` |
-| `catalog-glue` | moto at `moto-glue.local:5000` plus MinIO | `cargo test -p moonlink --features=catalog-glue,storage-s3` |
+| `storage-s3` | MinIO at `s3.local:9000` (`minioadmin`/`minioadmin`) | `cargo test --locked -p moonlink --lib --features storage-s3`; `cargo test test_s3_chaos --features=chaos-test,storage-s3 -p moonlink` |
 | `test-tls` | Postgres with TLS (`sslmode=verify-full`) | not run by CI either |
 
 ## Known flaky tests
@@ -131,7 +127,6 @@ These tests fail intermittently. When one of them fails, rerun before investigat
 
 | Test | Symptom | Cause |
 |---|---|---|
-| backend `test_basic::test_create_iceberg_snapshot`, `test_table_recovery::test_recovery`, `test_replication_recovery::test_reconnect_resumes_replication_*` and other scans right after a restart or reconnect | panic in `union_read/read_state_manager.rs`: `assertion failed: (left <= right)` | A scan reads the table's commit LSN and the replication LSN without a consistent view, and they are published in the opposite order. This is a real race in the read path, not a test bug, and shows up more under CPU load. |
 | service `test::postgres::test_create_table_from_postgres` | `assertion left == right failed` on `cardinality` (0 vs 2) | `list_tables` reports the rows of the latest in-memory snapshot. Right after `create_table` returns, the initial-copy rows may not be in a snapshot yet. |
 | connectors `cdc_event_test::{test_null, test_composite_types}` | `replication slot ... is active for PID n` during cleanup | Fixed in the test helpers (slot drop terminates the walsender and retries). An aborted run of an older checkout leaves the test table, publication and types behind; `scripts/test.sh pg --clean-pg` removes them. |
 

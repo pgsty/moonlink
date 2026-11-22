@@ -42,7 +42,7 @@ pub fn persistence_wait_retries() -> usize {
 /// Use up one injected persistence failure, if any is left, and return its error.
 pub(crate) fn take_injected_persistence_failure() -> Option<crate::Error> {
     PERSISTENCE_FAILURES_TO_INJECT
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
             left.checked_sub(1)
         })
         .ok()?;

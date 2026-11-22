@@ -2,7 +2,7 @@
 
 [![Website: mooncake.pgsty.com](https://img.shields.io/badge/Website-mooncake.pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://mooncake.pgsty.com/)
 [![Docs: moonlink](https://img.shields.io/badge/Docs-moonlink-slategray?style=flat)](https://mooncake.pgsty.com/docs/intro/moonlink/)
-[![Version: v0.3.0](https://img.shields.io/badge/Version-v0.3.0-slategray?style=flat)](https://github.com/pgsty/moonlink/releases)
+[![Version: v0.3.0-pgsty.1](https://img.shields.io/badge/Version-v0.3.0--pgsty.1-slategray?style=flat)](https://github.com/pgsty/moonlink/releases)
 [![License: BSL-1.1 + Exception](https://img.shields.io/badge/License-BSL--1.1%20%2B%20Exception-slategray?style=flat)](https://github.com/pgsty/moonlink/blob/main/LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/pgsty/moonlink?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/moonlink&Date)
 
@@ -16,9 +16,9 @@
 
 `moonlink` is the real-time storage and ingestion engine of the **Mooncake** family maintained by [PGSTY](https://pgsty.com):
 
-- **[`pg_mooncake`](https://github.com/pgsty/pg_mooncake)** ([Docs](https://mooncake.pgsty.com/docs/intro/) / [Meta](https://pgext.cloud/ext/pg_mooncake)): PostgreSQL 15–19 extension (`v0.3.1`, MIT) providing `mooncake.create_table()`, logical replication workers, and transparent query routing via `pg_duckdb` `1.2.1`.
-- **[`moonlink`](https://github.com/pgsty/moonlink)** ([Docs](https://mooncake.pgsty.com/docs/intro/moonlink/)): Rust real-time Iceberg v3 ingestion engine (`v0.3.0`, BSL-1.1 with `pg_mooncake` Linking & Distribution Exception; client crates MIT).
-- **[`duckdb_mooncake`](https://github.com/pgsty/duckdb_mooncake)** ([Docs](https://mooncake.pgsty.com/docs/intro/duckdb-mooncake/)): DuckDB `v2.0.1` storage & catalog scanner extension (`v0.0.3`, MIT) merging in-memory Arrow IPC buffers, Roaring deletion vectors, and flushed Parquet files with LSN snapshot consistency.
+- **[`pg_mooncake`](https://github.com/pgsty/pg_mooncake)** provides the PostgreSQL 15–19 integration through `pg_duckdb 1.2.1`.
+- **[`moonlink`](https://github.com/pgsty/moonlink)** maintains Iceberg mirrors from the PostgreSQL replication stream.
+- **[`duckdb_mooncake`](https://github.com/pgsty/duckdb_mooncake)** reads those mirrors in DuckDB `v2.0.1`.
 
 ---
 
@@ -43,11 +43,26 @@ Postgres ───►│  ││  index  │ │  cache  ││  ├──►│
              └─────────────────────────────┘                         
 ```
 
+## PGSTY patch release v0.3.0-pgsty.1
+
+The upstream-aligned `v0.3.0` tag remains at `dcf999a9`. The downstream patch release adds
+generation-checked mirror management and source-side WAL watermarks for `pg_mooncake 0.3.2`
+and scanner `v0.0.4`. It separates scratch storage from Iceberg tables and checks for
+legacy WAL before recovery. Each new local mirror requires a fresh Iceberg table directory.
+If a previous creation was interrupted and left a directory, verify its ownership and move it
+aside before retrying. Give each deployment exclusive ownership of its object-store table prefixes.
+
+The storage engine uses Iceberg 0.11, Arrow and Parquet 58.4.2, OpenDAL 0.58.2 and SQLx 0.9.1.
+The lockfile includes libsqlite3-sys 0.40.0. The November 23, 2026 RustSec snapshot matched
+zero vulnerabilities and three unmaintained crates. Atomic writes stage files under
+`.moonlink_atomic_tmp` by default. After an interrupted write, stop every process sharing the
+staging directory before manually removing identified temporary files.
+
 ## Version v0.3.0
 
 Version `v0.3.0` syncs upstream [`Mooncake-Labs/moonlink` `v0.3-dev`](https://github.com/Mooncake-Labs/moonlink/tree/v0.3-dev) (`dcf999a9`), pinned by [`pg_mooncake v0.3.1`](https://github.com/pgsty/pg_mooncake/releases/tag/v0.3.1) and [`duckdb_mooncake v0.0.3`](https://github.com/pgsty/duckdb_mooncake/releases/tag/v0.0.3):
 
-- **Lean Embedded Footprint & Clean Advisories**: Removes unused Delta Lake, DataFusion, REST/Glue catalog, Kafka, OpenTelemetry, GCS, and standalone WAL code, upgrades Arrow/Parquet to `56`, and clears all open RustSec vulnerability advisories.
+- The release removes unused Delta Lake, DataFusion, REST/Glue catalog, Kafka, OpenTelemetry, GCS and standalone WAL code, and upgrades Arrow/Parquet to `56`. The November 22, 2026 RustSec snapshot matched 22 vulnerabilities in the full v0.3.0 lockfile.
 - **Hardened CDC, Recovery & Storage**: Guarantees initial copy durability before `create_table` returns, enforces per-table errored state isolation, adds atomic Iceberg metadata writes, disk-full backoff, bounded memory caches, Iceberg file garbage collection (`MOONLINK_ICEBERG_GC`), partition leaf `REPLICA IDENTITY FULL`, and unrelated-WAL forced snapshot completion.
 - **Wire-Compatible RPC**: Preserves the exact `moonlink_rpc` and `moonlink_table_metadata` wire format guarded by `tests/wire_golden.rs`.
 
@@ -142,12 +157,12 @@ A query at an LSN (and `mooncake.create_snapshot`) first waits until replication
 
 ## Durability and Recovery
 
-> **Before upgrading from pg_mooncake 0.2 (Moonlink with its own WAL), snapshot every mirror, or re-create every mirror after the upgrade.** That version acknowledged changes to Postgres once they were in its `_wal` directory. The new version does not read that directory, and Postgres does not send those changes again, so a mirror silently misses every change that had not reached Iceberg yet. Before upgrading:
-> 1. Stop writes to the mirrored tables.
-> 2. Still on the old version, run `CALL mooncake.create_snapshot('<mirror>');` for every mirror.
-> 3. Upgrade.
->
-> If you upgraded without these steps, drop and re-create every mirror. Until the old WAL directory, `$PGDATA/pg_mooncake/_wal`, is deleted, Moonlink logs a warning at startup naming the mirrors that have files in it. Delete it once every mirror is snapshotted or re-created; dropping a mirror no longer removes its part of it.
+> **PGSTY pg_mooncake 0.3.0 and older upstream installations using a private `_wal` require a migration.**
+> Stop writers and keep a recoverable backup. With the old binaries, compare every mirror with its
+> quiescent source in both directions and take a snapshot covering its last change. Stop PostgreSQL
+> cleanly and move the verified old `_wal` offline with the backup. The patched worker refuses to
+> start with a nonempty `_wal`. Recheck each mirror after the upgrade and rebuild it from the source
+> if the old snapshot or its completeness cannot be verified.
 
 Moonlink acknowledges the Postgres replication slot only up to changes that every mirror has persisted in Iceberg. After a restart or a dropped replication connection, Postgres re-sends everything after that point, and Moonlink skips what it had already applied.
 
@@ -198,7 +213,7 @@ Full documentation is available at **[mooncake.pgsty.com/docs/intro/moonlink](ht
 
 - [Moonlink Ingestion Engine Overview](https://mooncake.pgsty.com/docs/intro/moonlink/)
 - [Mooncake Architecture](https://mooncake.pgsty.com/docs/intro/architecture/)
-- [duckdb_mooncake Scanner (`v0.0.3`)](https://mooncake.pgsty.com/docs/intro/duckdb-mooncake/)
+- [duckdb_mooncake Scanner](https://mooncake.pgsty.com/docs/intro/duckdb-mooncake/)
 - [Iceberg & Object Storage Reference](https://mooncake.pgsty.com/docs/reference/iceberg/)
 - [Licensing & BSL-1.1 Exception Details](https://mooncake.pgsty.com/docs/about/license/)
 

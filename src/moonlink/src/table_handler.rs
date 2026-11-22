@@ -1281,10 +1281,7 @@ impl TableHandler {
         table: &mut MooncakeTable,
         table_handler_state: &mut TableHandlerState,
     ) {
-        let buffered_events = table_handler_state
-            .initial_copy_buffered_events
-            .drain(..)
-            .collect::<Vec<_>>();
+        let buffered_events = std::mem::take(&mut table_handler_state.initial_copy_buffered_events);
         for event in buffered_events {
             Self::process_cdc_table_event(event, table, table_handler_state).await;
         }

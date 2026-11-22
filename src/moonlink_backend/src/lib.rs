@@ -143,6 +143,14 @@ impl MoonlinkBackend {
         })?;
         let base_path = tokio::fs::canonicalize(base_path).await?;
         let base_path_str = base_path.to_str().unwrap();
+        let entries = if metadata_store_accessor.metadata_table_exists().await? {
+            metadata_store_accessor
+                .get_all_table_metadata_entries()
+                .await?
+        } else {
+            Vec::new()
+        };
+        recovery_utils::check_storage(&base_path, &entries).await?;
 
         // Re-create directory for temporary files directory and read cache files directory under base directory.
         let temp_files_dir = file_utils::get_temp_file_directory_under_base(base_path_str);
@@ -157,11 +165,10 @@ impl MoonlinkBackend {
 
         let backend_attributes = BackendAttributes {
             temp_files_dir: temp_files_dir.to_str().unwrap().to_string(),
-            base_path: base_path_str.to_string(),
         };
         let pending_recoveries = recovery_utils::recover_all_tables(
             backend_attributes,
-            &*metadata_store_accessor,
+            entries,
             read_state_filepath_remap.clone(),
             &mut replication_manager,
         )
@@ -202,6 +209,29 @@ impl MoonlinkBackend {
         Duration::from_millis(self.lsn_wait_timeout_ms.load(Ordering::Relaxed))
     }
 
+    async fn reader_at(
+        &self,
+        table: &MooncakeTableId,
+        requested: Option<u64>,
+    ) -> Result<(Arc<moonlink::ReadStateManager>, Option<u64>)> {
+        let (reader, watermark) = {
+            let manager = self.replication_manager.read().await;
+            let reader = manager.get_table_reader(table)?;
+            if requested != Some(u64::MAX) {
+                return Ok((reader, requested));
+            }
+            (reader, manager.source_watermark(table)?)
+        };
+        let lsn = tokio::time::timeout(self.lsn_wait_timeout(), watermark)
+            .await
+            .map_err(|_| {
+                Error::lsn_wait_timeout(format!(
+                    "source of mirror {table} did not return its WAL position"
+                ))
+            })??;
+        Ok((reader, Some(lsn)))
+    }
+
     /// Create an iceberg snapshot with the given LSN, return when the a snapshot is successfully created.
     /// If the requested database or table doesn't exist, return [`TableNotFound`] error.
     /// Only the wait for replication to reach `lsn` is bounded ([`LSN_WAIT_TIMEOUT_ENV`]).
@@ -210,10 +240,8 @@ impl MoonlinkBackend {
         validate_not_empty(&table, "table")?;
 
         let mooncake_table_id = MooncakeTableId { database, table };
-        let table_reader = {
-            let manager = self.replication_manager.read().await;
-            manager.get_table_reader(&mooncake_table_id)?
-        };
+        let (table_reader, position) = self.reader_at(&mooncake_table_id, Some(lsn)).await?;
+        let lsn = position.unwrap_or_default();
         // Resolve the LSN first, without any manager lock: `lsn` is the end of the caller's last
         // transaction, which need not be a commit of this table.
         let timeout = self.lsn_wait_timeout();
@@ -233,6 +261,12 @@ impl MoonlinkBackend {
             };
         let rx = {
             let mut manager = self.replication_manager.write().await;
+            if !Arc::ptr_eq(
+                &manager.get_table_reader(&mooncake_table_id)?,
+                &table_reader,
+            ) {
+                return Err(mirror_dropped_error(&mooncake_table_id));
+            }
             let writer = manager.get_table_event_manager(&mooncake_table_id)?;
             writer.initiate_snapshot(target_lsn).await
         };
@@ -275,8 +309,6 @@ impl MoonlinkBackend {
         table_config: String,
         input_schema: Option<Schema>,
     ) -> Result<()> {
-        validate_not_empty(&database, "database")?;
-        validate_not_empty(&table, "table")?;
         if input_schema.is_some() {
             return Err(Error::invalid_argument(
                 "input schema is only supported for event ingestion, which has been removed"
@@ -284,6 +316,31 @@ impl MoonlinkBackend {
             ));
         }
 
+        self.create_with_registration(
+            database,
+            table,
+            src_table_name,
+            src_uri,
+            table_config,
+            false,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn create_with_registration(
+        &self,
+        database: String,
+        table: String,
+        src_table_name: String,
+        src_uri: String,
+        table_config: String,
+        pg_managed: bool,
+    ) -> Result<String> {
+        validate_not_empty(&database, "database")?;
+        validate_not_empty(&table, "table")?;
+        let prefix = if pg_managed { "pg-" } else { "" };
+        let generation = format!("{prefix}{:032x}", rand::random::<u128>());
         let mooncake_table_id = MooncakeTableId {
             database: database.clone(),
             table: table.clone(),
@@ -316,17 +373,29 @@ impl MoonlinkBackend {
             (cur_moonlink_table_config, initial_copy_lsn, mirror_status)
         };
 
-        if let Err(e) = self
-            .record_new_mirror(
-                &mooncake_table_id,
-                initial_copy_lsn,
-                &mirror_status,
-                &src_table_name,
-                &src_uri,
-                moonlink_table_config,
-            )
-            .await
-        {
+        let recorded = async {
+            if let Some(lsn) = initial_copy_lsn {
+                self.wait_for_persistence(&mooncake_table_id, lsn, &mirror_status)
+                    .await?;
+            }
+            let mut manager = self.replication_manager.write().await;
+            if !manager.is_same_mirror(&mooncake_table_id, &mirror_status) {
+                return Err(mirror_dropped_error(&mooncake_table_id));
+            }
+            self.metadata_store_accessor
+                .store_table_metadata(
+                    &mooncake_table_id.database,
+                    &mooncake_table_id.table,
+                    &src_table_name,
+                    &src_uri,
+                    moonlink_table_config,
+                    &generation,
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = recorded {
             let mut manager = self.replication_manager.write().await;
             if manager.is_same_mirror(&mooncake_table_id, &mirror_status) {
                 if let Err(drop_error) = manager.drop_table(&mooncake_table_id).await {
@@ -335,42 +404,7 @@ impl MoonlinkBackend {
             }
             return Err(e);
         }
-        Ok(())
-    }
-
-    /// Record a new mirror in the metadata store, once its initial copy is persisted. Recovery
-    /// resumes a recorded mirror from its iceberg table and the replication slot, which only holds
-    /// changes after the copy: copied rows that are not persisted yet would be lost for good. A
-    /// restart before the mirror is recorded loses the whole mirror, and create_table fails.
-    async fn record_new_mirror(
-        &self,
-        mooncake_table_id: &MooncakeTableId,
-        initial_copy_lsn: Option<u64>,
-        mirror_status: &watch::Receiver<moonlink::TableStatus>,
-        src_table_name: &str,
-        src_uri: &str,
-        moonlink_table_config: moonlink::MoonlinkTableConfig,
-    ) -> Result<()> {
-        if let Some(lsn) = initial_copy_lsn {
-            self.wait_for_persistence(mooncake_table_id, lsn, mirror_status)
-                .await?;
-        }
-        // Under the manager lock, so a concurrent drop either removes the record afterwards or
-        // finds no mirror to record.
-        let mut manager = self.replication_manager.write().await;
-        if !manager.is_same_mirror(mooncake_table_id, mirror_status) {
-            return Err(mirror_dropped_error(mooncake_table_id));
-        }
-        self.metadata_store_accessor
-            .store_table_metadata(
-                &mooncake_table_id.database,
-                &mooncake_table_id.table,
-                src_table_name,
-                src_uri,
-                moonlink_table_config,
-            )
-            .await?;
-        Ok(())
+        Ok(generation)
     }
 
     /// The manager, write-locked once no earlier connection to `src_uri`'s database is shutting
@@ -444,6 +478,33 @@ impl MoonlinkBackend {
     }
 
     pub async fn drop_table(&self, database: String, table: String) -> Result<()> {
+        self.drop_current(database, table, None).await
+    }
+
+    pub async fn registration(&self, database: &str, table: &str) -> Result<Option<String>> {
+        Ok(self
+            .metadata_store_accessor
+            .registration(database, table)
+            .await?)
+    }
+
+    pub async fn registered_databases(&self) -> Result<Vec<String>> {
+        Ok(self.metadata_store_accessor.registered_databases().await?)
+    }
+
+    pub async fn managed_registrations(&self, database: &str) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .metadata_store_accessor
+            .managed_registrations(database)
+            .await?)
+    }
+
+    pub async fn drop_current(
+        &self,
+        database: String,
+        table: String,
+        expected: Option<&str>,
+    ) -> Result<()> {
         validate_not_empty(&database, "database")?;
         validate_not_empty(&table, "table")?;
 
@@ -452,7 +513,15 @@ impl MoonlinkBackend {
         // Under the manager lock, like create_table's recording, so a drop and a create of the same
         // name cannot interleave their metadata changes.
         let mut manager = self.replication_manager.write().await;
-        if !manager.drop_table(&mooncake_table_id).await? {
+        if let Some(expected) = expected {
+            let registered = self
+                .registration(&mooncake_table_id.database, &mooncake_table_id.table)
+                .await?;
+            if registered.as_deref() != Some(expected) {
+                return Ok(());
+            }
+        }
+        if !manager.drop_table(&mooncake_table_id).await? && expected.is_none() {
             return Ok(());
         }
         match self
@@ -481,7 +550,7 @@ impl MoonlinkBackend {
     /// TODO(hjiang): Currently it only supports local parquet files.
     pub async fn get_parquet_metadatas(&self, data_files: Vec<String>) -> Result<Vec<Vec<u8>>> {
         let http_filepath_remap = self.http_filepath_remap.clone();
-        let serialized_metadatas: Vec<Vec<u8>> = stream::iter(data_files.into_iter())
+        let serialized_metadatas: Vec<Vec<u8>> = stream::iter(data_files)
             .map(move |cur_data_file| {
                 let http_filepath_remap_clone = http_filepath_remap.clone();
                 async move {
@@ -608,10 +677,7 @@ impl MoonlinkBackend {
         let mooncake_table_id = MooncakeTableId { database, table };
         // Do not hold the manager lock while waiting for the LSN: a queued writer (drop/create
         // table) would otherwise block every scan of every table behind this wait.
-        let table_reader = {
-            let manager = self.replication_manager.read().await;
-            manager.get_table_reader(&mooncake_table_id)?
-        };
+        let (table_reader, lsn) = self.reader_at(&mooncake_table_id, lsn).await?;
         let timeout = self.lsn_wait_timeout();
         match tokio::time::timeout(timeout, table_reader.try_read(lsn)).await {
             Ok(read_state) => Ok(read_state?),
@@ -681,11 +747,11 @@ fn validate_not_empty(field: &str, name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    use crate::parquet_utils::deserialize_parquet_metadata;
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use moonlink_metadata_store::SqliteMetadataStore;
     use parquet::arrow::arrow_writer::ArrowWriter;
+    use parquet::file::metadata::ParquetMetaDataReader;
     use std::fs::File as StdFile;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -739,10 +805,10 @@ mod tests {
             .unwrap();
         // Validate metadatas are returned in the correct order.
         assert_eq!(parquet_metadatas.len(), 2);
-        let metadata_1 = deserialize_parquet_metadata(&parquet_metadatas[0][..]);
-        assert_eq!(metadata_1.num_rows, 5);
-        let metadata_2 = deserialize_parquet_metadata(&parquet_metadatas[1][..]);
-        assert_eq!(metadata_2.num_rows, 2);
+        let metadata_1 = ParquetMetaDataReader::decode_metadata(&parquet_metadatas[0]).unwrap();
+        assert_eq!(metadata_1.file_metadata().num_rows(), 5);
+        let metadata_2 = ParquetMetaDataReader::decode_metadata(&parquet_metadatas[1]).unwrap();
+        assert_eq!(metadata_2.file_metadata().num_rows(), 2);
     }
 
     #[tokio::test]

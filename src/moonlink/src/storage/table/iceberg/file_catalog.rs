@@ -9,8 +9,7 @@ use crate::storage::table::iceberg::io_utils as iceberg_io_utils;
 use crate::storage::table::iceberg::moonlink_catalog::{
     CatalogAccess, PuffinBlobType, PuffinWrite, SchemaUpdate,
 };
-use crate::storage::table::iceberg::puffin_writer_proxy::PuffinBlobMetadataProxy;
-use crate::storage::table::iceberg::table_commit_proxy::TableCommitProxy;
+use crate::storage::table::iceberg::puffin_writer_proxy::PuffinFileMetadata;
 use crate::storage::table::iceberg::table_update_proxy::TableUpdateProxy;
 
 use futures::future::join_all;
@@ -55,7 +54,10 @@ use iceberg::spec::{
 use iceberg::table::Table;
 use iceberg::Error as IcebergError;
 use iceberg::Result as IcebergResult;
-use iceberg::{Catalog, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent};
+use iceberg::{
+    Catalog, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement,
+    TableUpdate,
+};
 
 /// Object storage usually doesn't have "folder" concept, when creating a new namespace, we create an indicator file under certain folder.
 pub(super) const NAMESPACE_INDICATOR_OBJECT_NAME: &str = "indicator.text";
@@ -81,6 +83,104 @@ pub struct FileCatalog {
 }
 
 impl FileCatalog {
+    pub(super) async fn commit_updates(
+        &self,
+        ident: &TableIdent,
+        requirements: Vec<TableRequirement>,
+        updates: Vec<TableUpdate>,
+    ) -> IcebergResult<Table> {
+        let (metadata_filepath, metadata) = self.load_metadata(ident).await?;
+        // Next version after the current metadata file. (Not next_sequence_number(): schema-only
+        // updates don't bump it, which would overwrite the current metadata file in place.)
+        let version = metadata_file_version(&metadata_filepath)
+            .map(|v| v + 1)
+            .ok_or_else(|| {
+                IcebergError::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    format!("unexpected metadata file name {metadata_filepath}"),
+                )
+            })?;
+        let builder = TableMetadataBuilder::new_from_metadata(
+            metadata.clone(),
+            /*current_file_location=*/ Some(metadata_filepath.clone()),
+        );
+
+        // Validate existing table metadata with requirements.
+        validate_table_requirements(requirements, &metadata)?;
+
+        // Construct new metadata with updates.
+        let builder = reflect_table_updates(builder, updates)?;
+        let metadata = expire_snapshots_and_metadata_log(builder.build()?.metadata)?;
+
+        // Write metadata file.
+        let metadata_directory = format!(
+            "{}/{}/metadata",
+            ident.namespace().to_url_string(),
+            ident.name()
+        );
+        let new_metadata_filepath = format!("{metadata_directory}/v{version}.metadata.json",);
+        let table = Table::builder()
+            .runtime(iceberg::Runtime::try_current()?)
+            .identifier(ident.clone())
+            .file_io(self.file_io.clone())
+            .metadata(metadata)
+            .metadata_location(format!(
+                "{}/{new_metadata_filepath}",
+                self.warehouse_location
+            ))
+            .build()?;
+        append_puffin_metadata_and_rewrite(
+            &table,
+            &self.table_update_proxy.deletion_vector_blobs_to_add,
+            &self.table_update_proxy.file_index_blobs_to_add,
+            &self.table_update_proxy.data_files_to_remove,
+            &self.table_update_proxy.puffin_blobs_to_remove,
+        )
+        .await?;
+        let metadata_json = serde_json::to_vec(table.metadata())?;
+        self.filesystem_accessor
+            .write_object(&new_metadata_filepath, metadata_json)
+            .await
+            .map_err(|e| {
+                IcebergError::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "Failed to write metadata file at table update".to_string(),
+                )
+                .with_retryable(true)
+                .with_source(e)
+            })?;
+
+        // Write version hint file.
+        let version_hint_path = format!("{metadata_directory}/version-hint.text");
+        let etag = {
+            let guard = self.etag.lock().await;
+            let etag = guard.borrow().as_ref().cloned();
+            etag
+        };
+        let object_metadata = self
+            .filesystem_accessor
+            .conditional_write_object(
+                &version_hint_path,
+                format!("{version}").as_bytes().to_vec(),
+                etag,
+            )
+            .await
+            .map_err(|e| {
+                IcebergError::new(
+                    iceberg::ErrorKind::Unexpected,
+                    format!("Failed to write version hint file existence {version_hint_path}"),
+                )
+                .with_retryable(true)
+                .with_source(e)
+            })?;
+        {
+            let guard = self.etag.lock().await;
+            *guard.borrow_mut() = object_metadata.etag().map(|etag| etag.to_string());
+        }
+
+        Ok(table)
+    }
+
     /// Create a file catalog, which gets initialized lazily.
     pub fn new(
         accessor_config: AccessorConfig,
@@ -118,8 +218,7 @@ impl FileCatalog {
         filesystem_accessor: Arc<dyn BaseFileSystemAccess>,
         iceberg_schema: IcebergSchema,
     ) -> IcebergResult<Self> {
-        use iceberg::io::FileIOBuilder;
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
         Ok(Self {
             filesystem_accessor,
             file_io,
@@ -271,7 +370,7 @@ impl PuffinWrite for FileCatalog {
     fn record_puffin_metadata(
         &mut self,
         puffin_filepath: String,
-        puffin_metadata: Vec<PuffinBlobMetadataProxy>,
+        puffin_metadata: PuffinFileMetadata,
         puffin_blob_type: PuffinBlobType,
     ) {
         self.table_update_proxy.record_puffin_metadata(
@@ -558,6 +657,7 @@ impl Catalog for FileCatalog {
             })?;
 
         let table = Table::builder()
+            .runtime(iceberg::Runtime::try_current()?)
             .metadata(metadata)
             .identifier(table_ident)
             .file_io(self.file_io.clone())
@@ -572,6 +672,7 @@ impl Catalog for FileCatalog {
         // Build and return the table.
         let metadata_path = format!("{}/{}", self.warehouse_location, metadata_filepath);
         let table = Table::builder()
+            .runtime(iceberg::Runtime::try_current()?)
             .metadata_location(metadata_path)
             .metadata(metadata)
             .identifier(table_ident.clone())
@@ -581,7 +682,14 @@ impl Catalog for FileCatalog {
     }
 
     /// Drop a table from the catalog.
-    async fn drop_table(&self, table: &TableIdent) -> IcebergResult<()> {
+    async fn drop_table(&self, _table: &TableIdent) -> IcebergResult<()> {
+        Err(IcebergError::new(
+            iceberg::ErrorKind::FeatureUnsupported,
+            "The filesystem catalog cannot unregister a table while retaining its metadata",
+        ))
+    }
+
+    async fn purge_table(&self, table: &TableIdent) -> IcebergResult<()> {
         let directory = format!("{}/{}", table.namespace().to_url_string(), table.name());
         self.filesystem_accessor
             .remove_directory(&directory)
@@ -643,99 +751,11 @@ impl Catalog for FileCatalog {
         todo!("rename table is not supported yet!")
     }
 
-    /// Update a table to the catalog, which writes metadata file and version hint file.
     async fn update_table(&self, mut commit: TableCommit) -> IcebergResult<Table> {
-        let (metadata_filepath, metadata) = self.load_metadata(commit.identifier()).await?;
-        // Next version after the current metadata file. (Not next_sequence_number(): schema-only
-        // updates don't bump it, which would overwrite the current metadata file in place.)
-        let version = metadata_file_version(&metadata_filepath)
-            .map(|v| v + 1)
-            .ok_or_else(|| {
-                IcebergError::new(
-                    iceberg::ErrorKind::DataInvalid,
-                    format!("unexpected metadata file name {metadata_filepath}"),
-                )
-            })?;
-        let builder = TableMetadataBuilder::new_from_metadata(
-            metadata.clone(),
-            /*current_file_location=*/ Some(metadata_filepath.clone()),
-        );
-
-        // Validate existing table metadata with requirements.
-        validate_table_requirements(commit.take_requirements(), &metadata)?;
-
-        // Construct new metadata with updates.
+        let requirements = commit.take_requirements();
         let updates = commit.take_updates();
-        let builder = reflect_table_updates(builder, updates)?;
-        let metadata = expire_snapshots_and_metadata_log(builder.build()?.metadata)?;
-
-        // Write metadata file.
-        let metadata_directory = format!(
-            "{}/{}/metadata",
-            commit.identifier().namespace().to_url_string(),
-            commit.identifier().name()
-        );
-        let new_metadata_filepath = format!("{metadata_directory}/v{version}.metadata.json",);
-        let metadata_json = serde_json::to_vec(&metadata)?;
-        self.filesystem_accessor
-            .write_object(&new_metadata_filepath, metadata_json)
+        self.commit_updates(commit.identifier(), requirements, updates)
             .await
-            .map_err(|e| {
-                IcebergError::new(
-                    iceberg::ErrorKind::Unexpected,
-                    "Failed to write metadata file at table update".to_string(),
-                )
-                .with_retryable(true)
-                .with_source(e)
-            })?;
-
-        // Manifest files and manifest list has persisted into storage, make modifications based on puffin blobs.
-        //
-        // TODO(hjiang): Add unit test for update and check manifest population.
-        append_puffin_metadata_and_rewrite(
-            &metadata,
-            &self.file_io,
-            &self.table_update_proxy.deletion_vector_blobs_to_add,
-            &self.table_update_proxy.file_index_blobs_to_add,
-            &self.table_update_proxy.data_files_to_remove,
-            &self.table_update_proxy.puffin_blobs_to_remove,
-        )
-        .await?;
-
-        // Write version hint file.
-        let version_hint_path = format!("{metadata_directory}/version-hint.text");
-        let etag = {
-            let guard = self.etag.lock().await;
-            let etag = guard.borrow().as_ref().cloned();
-            etag
-        };
-        let object_metadata = self
-            .filesystem_accessor
-            .conditional_write_object(
-                &version_hint_path,
-                format!("{version}").as_bytes().to_vec(),
-                etag,
-            )
-            .await
-            .map_err(|e| {
-                IcebergError::new(
-                    iceberg::ErrorKind::Unexpected,
-                    format!("Failed to write version hint file existence {version_hint_path}"),
-                )
-                .with_retryable(true)
-                .with_source(e)
-            })?;
-        {
-            let guard = self.etag.lock().await;
-            *guard.borrow_mut() = object_metadata.etag().map(|etag| etag.to_string());
-        }
-
-        Table::builder()
-            .identifier(commit.identifier().clone())
-            .file_io(self.file_io.clone())
-            .metadata(metadata)
-            .metadata_location(metadata_filepath)
-            .build()
     }
 
     async fn register_table(
@@ -759,13 +779,8 @@ impl SchemaUpdate for FileCatalog {
         metadata_builder = metadata_builder.add_current_schema(new_schema)?;
         let metadata_builder_result = metadata_builder.build()?;
 
-        let table_commit_proxy = TableCommitProxy {
-            ident: table_ident,
-            updates: metadata_builder_result.changes,
-            requirements: vec![],
-        };
-        let table_commit = table_commit_proxy.take_as_table_commit();
-        self.update_table(table_commit).await
+        self.commit_updates(&table_ident, Vec::new(), metadata_builder_result.changes)
+            .await
     }
 }
 

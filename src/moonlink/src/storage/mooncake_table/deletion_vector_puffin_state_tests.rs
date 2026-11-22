@@ -490,7 +490,7 @@ async fn test_2_compact_without_local_optimization() {
     assert_eq!(disk_files.len(), 2);
     let mut old_compacted_puffin_file_ids = vec![];
     let mut old_compacted_puffin_files = vec![];
-    for (_, disk_entry) in disk_files.iter() {
+    for disk_entry in disk_files.values() {
         old_compacted_puffin_file_ids.push(
             disk_entry
                 .puffin_deletion_blob
@@ -578,7 +578,7 @@ async fn test_2_compact_with_local_optimization() {
     assert_eq!(disk_files.len(), 2);
     let mut old_compacted_puffin_file_ids = vec![];
     let mut old_compacted_puffin_files = vec![];
-    for (_, disk_entry) in disk_files.iter() {
+    for disk_entry in disk_files.values() {
         old_compacted_puffin_file_ids.push(
             disk_entry
                 .puffin_deletion_blob

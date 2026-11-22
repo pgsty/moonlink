@@ -14,19 +14,19 @@ default = ["storage-fs"]
 storage-all = ["storage-fs", "storage-s3"]
 test-utils = []
 
-storage-fs = ["opendal/services-fs", "iceberg/storage-fs"]
+storage-fs = ["opendal/services-fs"]
 storage-s3 = [
     "opendal/services-s3",
-    "iceberg/storage-s3",
+    "dep:iceberg-storage-opendal",
     "base64",
     "hmac",
     "sha1",
 ]
 
-bench = []
+bench = ["dep:inferno", "dep:pprof"]
 
 chaos-test = ["function_name"]
-profile-test = ["pprof", "function_name"]
+profile-test = ["dep:inferno", "dep:pprof", "function_name"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -48,6 +48,8 @@ futures = { workspace = true }
 hashbrown = { workspace = true }
 hmac = { version = "0.12", optional = true }
 iceberg = { workspace = true }
+iceberg-storage-opendal = { version = "0.11.0", default-features = false, features = ["opendal-s3"], optional = true }
+inferno = { version = "0.12.7", default-features = false, optional = true }
 itertools = { workspace = true }
 lru = { workspace = true }
 memmap2 = "0.9"
@@ -61,7 +63,7 @@ num-bigint = { workspace = true }
 num-traits = { workspace = true }
 opendal = { workspace = true }
 parquet = { workspace = true }
-pprof = { version = "0.15", features = ["flamegraph", "criterion"], optional = true }
+pprof = { version = "0.15", optional = true }
 prost = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
@@ -69,6 +71,7 @@ roaring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha1 = { version = "0.10", optional = true }
+sha2 = "0.10"
 siphasher = "1"
 smallvec = { workspace = true }
 tempfile = { workspace = true }

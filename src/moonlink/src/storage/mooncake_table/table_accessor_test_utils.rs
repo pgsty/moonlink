@@ -141,7 +141,7 @@ pub(crate) async fn get_data_files_and_index_block_files(table: &MooncakeTable) 
 
     // Check and get data files.
     let disk_files = guard.current_snapshot.disk_files.clone();
-    for (cur_file, _) in disk_files.iter() {
+    for cur_file in disk_files.keys() {
         files.push(cur_file.file_path().to_string());
     }
 

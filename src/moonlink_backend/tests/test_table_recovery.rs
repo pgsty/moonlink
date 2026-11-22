@@ -38,14 +38,14 @@ mod tests {
                 .moonlink_table_config
                 .iceberg_table_config
                 .namespace,
-            vec![format!("{DATABASE}")],
+            vec![DATABASE.to_string()],
         );
         assert_eq!(
             metadata_entries[0]
                 .moonlink_table_config
                 .iceberg_table_config
                 .table_name,
-            format!("{TABLE}")
+            TABLE.to_string()
         );
 
         // Drop table and check metadata storage.

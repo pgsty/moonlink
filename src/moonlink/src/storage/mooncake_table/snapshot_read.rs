@@ -75,7 +75,7 @@ impl SnapshotTableState {
     /// If a data file already has a pinned reference, increment the reference count directly to avoid unnecessary IO.
     async fn get_read_files_for_read(&mut self) -> Vec<DataFileForRead> {
         let mut data_files_for_read = Vec::with_capacity(self.current_snapshot.disk_files.len());
-        for (file, _) in self.current_snapshot.disk_files.iter() {
+        for file in self.current_snapshot.disk_files.keys() {
             let unique_table_file_id = self.get_table_unique_file_id(file.file_id());
             data_files_for_read.push(DataFileForRead::RemoteFilePath((
                 unique_table_file_id,

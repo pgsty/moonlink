@@ -3,6 +3,8 @@ pub mod event_sync;
 pub mod lsn_state;
 pub mod mooncake_table_id;
 mod observability;
+#[cfg(any(feature = "bench", feature = "profile-test"))]
+pub mod profiling;
 pub mod row;
 mod storage;
 pub(crate) mod table_handler;

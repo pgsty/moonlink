@@ -25,7 +25,6 @@ mod table_update_proxy;
 
 mod schema_utils;
 mod snapshot_utils;
-mod table_commit_proxy;
 pub(crate) mod table_property;
 pub(crate) mod utils;
 pub(crate) mod validation;

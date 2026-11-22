@@ -242,11 +242,10 @@ impl SnapshotTableState {
         let mut groups: HashMap<usize, CompactionGroup> = HashMap::new();
         for (i, f) in files.iter().enumerate() {
             let entry = &disk_files[*f];
-            let deletion_percentage = if entry.num_rows == 0 {
-                0
-            } else {
-                entry.committed_deletion_vector.get_num_rows_deleted() * 100 / entry.num_rows
-            };
+            let deleted_rows = entry.committed_deletion_vector.get_num_rows_deleted() as u128;
+            let deletion_percentage = (deleted_rows * 100)
+                .checked_div(entry.num_rows as u128)
+                .unwrap_or(0) as usize;
             groups
                 .entry(find(&mut parent, i))
                 .or_default()

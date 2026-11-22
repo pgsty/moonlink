@@ -364,14 +364,14 @@ pub async fn id_counts_from_state_with_deletes(read_state: &ReadState) -> HashMa
 pub async fn data_files_and_deleted_rows(
     read_state: &ReadState,
 ) -> (Vec<String>, Vec<PositionDelete>) {
-    use iceberg::io::FileIOBuilder;
+    use iceberg::io::FileIO;
     use iceberg::puffin::PuffinReader;
 
     let (data_files, puffin_files, deletion_vectors, mut position_deletes) =
         decode_read_state_for_testing(read_state);
 
     // Load deletion vector blobs and convert to position deletes
-    let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+    let file_io = FileIO::new_with_fs();
     for cur_blob in deletion_vectors.iter() {
         let puffin_file_path = puffin_files
             .get(cur_blob.puffin_file_number as usize)
@@ -379,7 +379,7 @@ pub async fn data_files_and_deleted_rows(
 
         // Load puffin file and read blob
         let input_file = file_io.new_input(puffin_file_path).unwrap();
-        let puffin_reader = PuffinReader::new(input_file);
+        let puffin_reader = PuffinReader::new(input_file).await.unwrap();
         let puffin_metadata = puffin_reader.file_metadata().await.unwrap();
 
         // Assume single blob per puffin file (as per moonlink convention)

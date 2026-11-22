@@ -101,7 +101,7 @@ pub enum PostgresReplicationCommand {
 
 pub struct PostgresConnection {
     pub uri: String,
-    pub postgres_client: Client,
+    pub postgres_client: Arc<Client>,
     pub source: Arc<PostgresSource>,
     pub slot_name: String,
     pub cmd_tx: mpsc::Sender<PostgresReplicationCommand>,
@@ -354,7 +354,7 @@ impl PostgresConnection {
 
         Ok(Self {
             uri,
-            postgres_client,
+            postgres_client: Arc::new(postgres_client),
             source: Arc::new(postgres_source),
             slot_name,
             cmd_tx,
@@ -388,7 +388,7 @@ impl PostgresConnection {
             .simple_query("SET lock_timeout = '100ms';")
             .await
             .map_err(PostgresSourceError::from)?;
-        self.postgres_client = client;
+        self.postgres_client = Arc::new(client);
         Ok(())
     }
 
@@ -1040,16 +1040,14 @@ impl PostgresConnection {
             moonlink_table_config: moonlink_table_config.clone(),
         };
 
-        // A new mirror starts from the source alone: an iceberg table left at its path (by a
-        // mirror of the same name whose drop could not finish) must not be loaded.
         if !is_recovery {
-            crate::errored_tables::drop_iceberg_table_files(
+            crate::errored_tables::reserve_iceberg_location(
                 &moonlink_table_config.iceberg_table_config,
             )
             .await?;
         }
         let mut table_resources = build_table_components(
-            mooncake_table_id.to_string(),
+            &mooncake_table_id,
             arrow_schema,
             table_name.to_string(),
             table_schema.src_table_id,

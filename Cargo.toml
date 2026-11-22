@@ -19,15 +19,15 @@ license = "LicenseRef-BSL-1.1"
 
 [workspace.dependencies]
 anyhow = "1.0"
-arrow = { version = "56", default-features = false, features = [
-  "canonical_extension_types",
+arrow = { version = "58.4.2", default-features = false, features = [
+    "canonical_extension_types",
 ] }
-arrow-array = "56"
-arrow-buffer = "56"
-arrow-ipc = "56"
-arrow-schema = { version = "56", features = ["serde"] }
+arrow-array = "58.4.2"
+arrow-buffer = "58.4.2"
+arrow-ipc = "58.4.2"
+arrow-schema = { version = "58.4.2", features = ["serde"] }
 async-stream = "0.3"
-async-trait = "0.1"
+async-trait = "0.1.92"
 backon = "1.6"
 bincode = { version = "2", features = ["serde"] }
 bitstream-io = "4.9"
@@ -38,9 +38,7 @@ crc32fast = "1"
 fastbloom = "0.14"
 futures = { version = "0.3", default-features = false }
 hashbrown = "0.16"
-iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "4a6ea15a7dd73e7c68b0a24441820b13bdd22a92", default-features = false, features = [
-  "storage-fs",
-] }
+iceberg = { version = "0.11.0", default-features = false }
 itertools = "0.14"
 lru = "0.18.2"
 moka = { version = "0.12", features = ["future"] }
@@ -59,11 +57,11 @@ native-tls = "0.2.14"
 nix = { version = "0.30", default-features = false, features = ["fs"] }
 num-bigint = "0.4"
 num-traits = "0.2"
-opendal = { version = "0.54", default-features = false, features = ["layers-throttle"] }
-parquet = { version = "56", default-features = false, features = [
-  "arrow",
-  "async",
-  "arrow_canonical_extension_types",
+opendal = { version = "0.58.2", default-features = false, features = ["executors-tokio", "layers-retry", "layers-throttle", "layers-timeout"] }
+parquet = { version = "58.4.2", default-features = false, features = [
+    "arrow",
+    "async",
+    "arrow_canonical_extension_types",
 ] }
 paste = "1"
 postgres-native-tls = { git = "https://github.com/Mooncake-labs/rust-postgres.git", rev = "14c8e599f5551a8caa96ff5023685a6f537a1455" }
@@ -82,19 +80,19 @@ smallvec = "1.15"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.48", default-features = false, features = [
-  "fs",
-  "io-util",
-  "macros",
-  "net",
-  "rt-multi-thread",
-  "signal",
-  "sync",
-  "time",
-  "tracing",
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "tracing",
 ] }
 tokio-bitstream-io = "0.0"
 tokio-postgres = { git = "https://github.com/Mooncake-labs/rust-postgres.git", rev = "14c8e599f5551a8caa96ff5023685a6f537a1455", features = [
-  "with-serde_json-1",
+    "with-serde_json-1",
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }

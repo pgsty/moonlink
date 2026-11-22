@@ -8,26 +8,24 @@
 //! every request with their message and can always be dropped.
 
 use crate::Result;
-use moonlink::{BaseFileSystemAccess, FileSystemAccessor, IcebergTableConfig, MooncakeTableId};
+use moonlink::{
+    BaseFileSystemAccess, FileSystemAccessor, IcebergCatalogConfig, IcebergTableConfig,
+    MooncakeTableId, StorageConfig,
+};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
 const MARKER_DIRECTORY: &str = "errored_tables";
 
-/// Per-mirror file under `<base>/<directory>`, named by the hex-encoded mirror id so any database
-/// or table name is safe.
 pub(crate) fn table_file_path(
     base_path: &str,
     directory: &str,
     mooncake_table_id: &MooncakeTableId,
 ) -> PathBuf {
-    let encoded: String = mooncake_table_id
-        .to_string()
-        .bytes()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    Path::new(base_path).join(directory).join(encoded)
+    Path::new(base_path)
+        .join(directory)
+        .join(mooncake_table_id.storage_key())
 }
 
 fn marker_path(base_path: &str, mooncake_table_id: &MooncakeTableId) -> PathBuf {
@@ -62,10 +60,54 @@ pub async fn remove_marker(base_path: &str, mooncake_table_id: &MooncakeTableId)
     }
 }
 
+pub(crate) async fn reserve_iceberg_location(config: &IcebergTableConfig) -> Result<()> {
+    let IcebergCatalogConfig::File { accessor_config } = &config.metadata_accessor_config;
+    let directory = format!("{}/{}", config.namespace[0], config.table_name);
+    #[allow(irrefutable_let_patterns)]
+    if let StorageConfig::FileSystem { root_directory, .. } = &accessor_config.storage_config {
+        let namespace = Path::new(root_directory).join(&config.namespace[0]);
+        tokio::fs::create_dir_all(&namespace).await?;
+        tokio::fs::create_dir(namespace.join(&config.table_name))
+            .await
+            .map_err(|err| {
+                std::io::Error::new(
+                    err.kind(),
+                    format!("cannot reserve Iceberg location {directory}: {err}"),
+                )
+            })?;
+        return Ok(());
+    }
+    let accessor = FileSystemAccessor::new(accessor_config.clone());
+    if accessor.object_exists(&directory).await?
+        || !accessor.list_direct_files(&directory).await?.is_empty()
+        || !accessor
+            .list_direct_subdirectories(&directory)
+            .await?
+            .is_empty()
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            format!("Iceberg location {directory} is occupied"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Delete a mirror's iceberg table without loading it (it may be unloadable). Uses the file
 /// catalog's layout, `<namespace>/<table>` under the catalog root, like its `drop_table`; a
 /// re-created mirror with the same name must never pick up the old data.
 pub async fn drop_iceberg_table_files(config: &IcebergTableConfig) -> Result<()> {
+    if config.namespace.len() != 1
+        || !MooncakeTableId::safe_namespace(&config.namespace[0])
+        || !MooncakeTableId::safe_table_name(&config.table_name)
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "unsafe persisted Iceberg location",
+        )
+        .into());
+    }
     let Some(accessor_config) = config
         .metadata_accessor_config
         .get_file_catalog_accessor_config()
@@ -93,4 +135,35 @@ pub struct ErroredTable {
     /// Connection string and table of its source, to clean up the source when it is dropped.
     pub src_uri: String,
     pub src_table_name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fresh_location_preserves_an_existing_directory() {
+        let warehouse = tempfile::tempdir().unwrap();
+        let accessor_config =
+            moonlink::AccessorConfig::new_with_storage_config(StorageConfig::FileSystem {
+                root_directory: warehouse.path().to_str().unwrap().to_owned(),
+                atomic_write_dir: None,
+            });
+        let config = IcebergTableConfig {
+            namespace: vec!["database".into()],
+            table_name: "public.mirror".into(),
+            data_accessor_config: accessor_config.clone(),
+            metadata_accessor_config: IcebergCatalogConfig::File { accessor_config },
+        };
+        reserve_iceberg_location(&config).await.unwrap();
+        let existing = warehouse.path().join("database/public.mirror/owner");
+        tokio::fs::write(&existing, b"existing warehouse")
+            .await
+            .unwrap();
+        assert!(reserve_iceberg_location(&config).await.is_err());
+        assert_eq!(
+            tokio::fs::read(existing).await.unwrap(),
+            b"existing warehouse"
+        );
+    }
 }

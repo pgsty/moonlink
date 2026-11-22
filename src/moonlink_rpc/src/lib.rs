@@ -1,6 +1,7 @@
 mod error;
 
 pub use error::{Error, Result, RpcResult};
+pub const SOURCE_WATERMARK: u64 = u64::MAX;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -44,6 +45,11 @@ rpcs! {
     optimize_table(database: String, table: String, mode: String) -> ();
     scan_table_begin(database: String, table: String, lsn: u64) -> Vec<u8>;
     scan_table_end(database: String, table: String) -> ();
+    registration(database: String, table: String) -> Option<String>;
+    drop_registration(database: String, table: String, generation: String) -> ();
+    registered_databases() -> Vec<String>;
+    create_registered_table(database: String, table: String, src: String, src_uri: String, table_config: String) -> String;
+    managed_registrations(database: String) -> Vec<(String, String)>;
 }
 
 pub async fn write<W: AsyncWrite + Unpin, S: Serialize>(writer: &mut W, data: &S) -> Result<()> {

@@ -170,8 +170,7 @@ impl IcebergTableManager {
     /// Get a unique puffin filepath under table warehouse uri.
     pub(super) fn get_unique_deletion_vector_filepath(&self) -> String {
         let location_generator =
-            DefaultLocationGenerator::new(self.iceberg_table.as_ref().unwrap().metadata().clone())
-                .unwrap();
+            DefaultLocationGenerator::new(self.iceberg_table.as_ref().unwrap().metadata()).unwrap();
         location_generator.generate_location(
             /*partition_key=*/ None,
             &format!("{}-deletion-vector-v1-puffin.bin", Uuid::now_v7()),
@@ -271,7 +270,7 @@ impl TableManager for IcebergTableManager {
             NamespaceIdent::from_strs(&self.config.namespace).unwrap(),
             self.config.table_name.clone(),
         );
-        self.catalog.drop_table(&table_ident).await?;
+        self.catalog.purge_table(&table_ident).await?;
 
         // Unset all data members.
         self.snapshot_loaded = false;

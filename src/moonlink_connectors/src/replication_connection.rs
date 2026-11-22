@@ -144,6 +144,10 @@ impl ReplicationConnection {
         self.replication_started
     }
 
+    pub(crate) fn sql_client(&self) -> Arc<tokio_postgres::Client> {
+        self.source.postgres_client.clone()
+    }
+
     pub fn get_table_reader(
         &self,
         mooncake_table_id: &MooncakeTableId,
@@ -332,7 +336,7 @@ impl ReplicationConnection {
             let _ =
                 errored_tables::drop_iceberg_table_files(&table_state.iceberg_table_config).await;
             let local_files =
-                std::path::Path::new(&self.table_base_path).join(mooncake_table_id.to_string());
+                mooncake_table_id.cache_path(std::path::Path::new(&self.table_base_path));
             if let Err(e) = tokio::fs::remove_dir_all(&local_files).await {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     warn!(error = ?e, ?local_files, "failed to delete the dropped mirror's local files");
@@ -368,7 +372,6 @@ impl ReplicationConnection {
                         warn!(error = ?e, "task join error during shutdown");
                     }
                 }
-                self.replication_started = false;
             }
             // A write in progress may still finish; a writer still retrying stops.
             self.shutdown_tx.send_replace(true);

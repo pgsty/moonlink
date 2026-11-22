@@ -834,15 +834,13 @@ impl SnapshotTableState {
                             self.current_snapshot.indices.insert_file_index(file_index);
                         });
                     // add local deletions
-                    self.committed_deletion_log
-                        .extend(commit.local_deletions.into_iter());
+                    self.committed_deletion_log.extend(commit.local_deletions);
                     // add pending deletions, stamped with the commit's LSN when it committed
                     debug_assert!(commit
                         .pending_deletions
                         .iter()
                         .all(|deletion| deletion.lsn < LSN_START_FOR_STREAMING_XACT));
-                    task.new_deletions
-                        .extend(commit.pending_deletions.into_iter());
+                    task.new_deletions.extend(commit.pending_deletions);
                 }
                 // A streamed transaction's deletions never leave its state before it commits, so
                 // there is nothing of an aborted one to undo here.
