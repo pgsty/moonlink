@@ -1,18 +1,30 @@
-<div align="center">
+# moonlink
 
-# Moonlink 🥮
-Postgres-to-Iceberg mirroring engine for pg_mooncake
+[![Website: mooncake.pgsty.com](https://img.shields.io/badge/Website-mooncake.pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://mooncake.pgsty.com/)
+[![Docs: moonlink](https://img.shields.io/badge/Docs-moonlink-slategray?style=flat)](https://mooncake.pgsty.com/docs/intro/moonlink/)
+[![Version: v0.3.0](https://img.shields.io/badge/Version-v0.3.0-slategray?style=flat)](https://github.com/pgsty/moonlink/releases)
+[![License: BSL-1.1 + Exception](https://img.shields.io/badge/License-BSL--1.1%20%2B%20Exception-slategray?style=flat)](https://github.com/pgsty/moonlink/blob/main/LICENSE)
+[![GitHub Stars](https://img.shields.io/github/stars/pgsty/moonlink?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/moonlink&Date)
 
-[![License](https://img.shields.io/badge/License-BSL-blue)](https://github.com/Mooncake-Labs/moonlink/blob/main/LICENSE)
-[![Slack](https://img.shields.io/badge/Mooncake%20Devs-purple?logo=slack)](https://join.slack.com/t/mooncake-devs/shared_invite/zt-2sepjh5hv-rb9jUtfYZ9bvbxTCUrsEEA)
-[![Twitter](https://img.shields.io/twitter/url?url=https%3A%2F%2Fx.com%2Fmooncakelabs&label=%40mooncakelabs)](https://x.com/mooncakelabs)
-[![Docs](https://img.shields.io/badge/docs-moonlink?style=flat&logo=readthedocs&logoColor=white)](https://docs.mooncake.dev/moonlink/intro)
+**`moonlink`** is an Iceberg-native Rust ingestion engine that mirrors PostgreSQL tables into Apache Iceberg tables via logical replication with sub-second freshness, powering [`pg_mooncake`](https://github.com/pgsty/pg_mooncake) and [`duckdb_mooncake`](https://github.com/pgsty/duckdb_mooncake).
 
-</div>
+[Website](https://mooncake.pgsty.com/) | [Documentation](https://mooncake.pgsty.com/docs/intro/moonlink/) | [pg_mooncake](https://github.com/pgsty/pg_mooncake) | [duckdb_mooncake](https://github.com/pgsty/duckdb_mooncake) | [Blog](https://mooncake.pgsty.com/blog/) | [PGEXT](https://pgext.cloud/ext/pg_mooncake) | [Releases](https://github.com/pgsty/moonlink/releases) | [Issues](https://github.com/pgsty/moonlink/issues) | [Upstream](https://github.com/Mooncake-Labs/moonlink)
+
+---
+
+## Mooncake Suite
+
+`moonlink` is the real-time storage and ingestion engine of the **Mooncake** family maintained by [PGSTY](https://pgsty.com):
+
+- **[`pg_mooncake`](https://github.com/pgsty/pg_mooncake)** ([Docs](https://mooncake.pgsty.com/docs/intro/) / [Meta](https://pgext.cloud/ext/pg_mooncake)): PostgreSQL 15–19 extension (`v0.3.1`, MIT) providing `mooncake.create_table()`, logical replication workers, and transparent query routing via `pg_duckdb` `1.2.1`.
+- **[`moonlink`](https://github.com/pgsty/moonlink)** ([Docs](https://mooncake.pgsty.com/docs/intro/moonlink/)): Rust real-time Iceberg v3 ingestion engine (`v0.3.0`, BSL-1.1 with `pg_mooncake` Linking & Distribution Exception; client crates MIT).
+- **[`duckdb_mooncake`](https://github.com/pgsty/duckdb_mooncake)** ([Docs](https://mooncake.pgsty.com/docs/intro/duckdb-mooncake/)): DuckDB `v2.0.1` storage & catalog scanner extension (`v0.0.3`, MIT) merging in-memory Arrow IPC buffers, Roaring deletion vectors, and flushed Parquet files with LSN snapshot consistency.
+
+---
 
 ## Overview
 
-Moonlink is the engine behind [`pg_mooncake`](https://github.com/Mooncake-Labs/pg_mooncake): it mirrors Postgres tables into Iceberg (columnstore) tables via logical replication, **without** separate maintenance and compaction jobs.
+Moonlink is the engine behind [`pg_mooncake`](https://github.com/pgsty/pg_mooncake): it mirrors Postgres tables into Iceberg (columnstore) tables via logical replication, **without** separate maintenance and compaction jobs.
 
 It runs inside a Postgres background worker started by pg_mooncake and is controlled over a unix socket (`moonlink_rpc`). Moonlink buffers, caches, and indexes data so Iceberg tables stay read-optimized.
 
@@ -31,7 +43,13 @@ Postgres ───►│  ││  index  │ │  cache  ││  ├──►│
              └─────────────────────────────┘                         
 ```
 
-> **Note:** Moonlink is in preview. Expect changes. Join our [Community](https://join.slack.com/t/mooncakelabs/shared_invite/zt-2sepjh5hv-rb9jUtfYZ9bvbxTCUrsEEA) to stay updated!
+## Version v0.3.0
+
+Version `v0.3.0` syncs upstream [`Mooncake-Labs/moonlink` `v0.3-dev`](https://github.com/Mooncake-Labs/moonlink/tree/v0.3-dev) (`dcf999a9`), pinned by [`pg_mooncake v0.3.1`](https://github.com/pgsty/pg_mooncake/releases/tag/v0.3.1) and [`duckdb_mooncake v0.0.3`](https://github.com/pgsty/duckdb_mooncake/releases/tag/v0.0.3):
+
+- **Lean Embedded Footprint & Clean Advisories**: Removes unused Delta Lake, DataFusion, REST/Glue catalog, Kafka, OpenTelemetry, GCS, and standalone WAL code, upgrades Arrow/Parquet to `56`, and clears all open RustSec vulnerability advisories.
+- **Hardened CDC, Recovery & Storage**: Guarantees initial copy durability before `create_table` returns, enforces per-table errored state isolation, adds atomic Iceberg metadata writes, disk-full backoff, bounded memory caches, Iceberg file garbage collection (`MOONLINK_ICEBERG_GC`), partition leaf `REPLICA IDENTITY FULL`, and unrelated-WAL forced snapshot completion.
+- **Wire-Compatible RPC**: Preserves the exact `moonlink_rpc` and `moonlink_table_metadata` wire format guarded by `tests/wire_golden.rs`.
 
 ## Why Moonlink?
 
@@ -82,8 +100,8 @@ Moonlink commits data as **Iceberg v3 tables with deletion vectors** (filesystem
 
 For sub-second freshness, readers ask moonlink for the current table state over the unix socket:
 
-1. **Postgres**: with the [`pg_mooncake`](https://github.com/Mooncake-Labs/pg_mooncake) extension.
-2. **DuckDB**: with the [`duckdb_mooncake`](https://github.com/Mooncake-Labs/duckdb_mooncake) extension (also used by pg_mooncake).
+1. **Postgres**: with the [`pg_mooncake`](https://github.com/pgsty/pg_mooncake) extension.
+2. **DuckDB**: with the [`duckdb_mooncake`](https://github.com/pgsty/duckdb_mooncake) extension (also used by pg_mooncake).
 
 ## Embedding
 
@@ -172,8 +190,26 @@ A mirror that can no longer follow its source table enters the errored state: qu
 
 A source that cannot be reached when moonlink starts (restarting, refusing connections) is not an error: its mirrors report that they are not available yet and are restored automatically once it is back. Postgres retains WAL for that database meanwhile. If it is still unreachable an hour after moonlink started, its mirrors enter the errored state (drop and re-create them), and the slot is no longer held for them.
 
-## Contributing
+---
 
-We’re grateful for our contributors. If you'd like to help improve Moonlink, join our [community](https://join.slack.com/t/mooncake-devs/shared_invite/zt-2sepjh5hv-rb9jUtfYZ9bvbxTCUrsEEA).
+## Documentation
 
-🥮
+Full documentation is available at **[mooncake.pgsty.com/docs/intro/moonlink](https://mooncake.pgsty.com/docs/intro/moonlink/)**:
+
+- [Moonlink Ingestion Engine Overview](https://mooncake.pgsty.com/docs/intro/moonlink/)
+- [Mooncake Architecture](https://mooncake.pgsty.com/docs/intro/architecture/)
+- [duckdb_mooncake Scanner (`v0.0.3`)](https://mooncake.pgsty.com/docs/intro/duckdb-mooncake/)
+- [Iceberg & Object Storage Reference](https://mooncake.pgsty.com/docs/reference/iceberg/)
+- [Licensing & BSL-1.1 Exception Details](https://mooncake.pgsty.com/docs/about/license/)
+
+---
+
+## License
+
+- **Core Engine Crates** (`moonlink`, `moonlink_backend`, `moonlink_connectors`, `moonlink_metadata_store`, `moonlink_service`): Licensed under the **Business Source License 1.1 ([`BSL-1.1`](LICENSE))** (Change Date: `2029-06-03`, Change License: `Apache-2.0`).
+  - **`PG_MOONCAKE LINKING & DISTRIBUTION EXCEPTION`**: Explicitly grants the right to statically or dynamically link `moonlink` object code with [`pg_mooncake`](https://github.com/pgsty/pg_mooncake) and distribute the combined executable under the MIT License applicable to `pg_mooncake`.
+- **Client & Wire-Protocol Crates** (`moonlink_rpc`, `moonlink_proto`, `moonlink_error`, `moonlink_table_metadata`): Licensed under the **MIT License**.
+
+- Copyright (c) 2025 Mooncake Labs, Inc.
+- Copyright (c) 2026 PGSTY PTE. LTD.
+- Maintained by [Ruohang Feng](mailto:rh@vonng.com) @ [PGSTY](https://pgsty.com)
