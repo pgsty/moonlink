@@ -1,10 +1,13 @@
 use core::str;
 use std::{
+    borrow::Cow,
     fmt::format,
     num::{ParseFloatError, ParseIntError},
+    sync::LazyLock,
 };
 
 use bigdecimal::ParseBigDecimalError;
+use chrono::format::{Item, ParseResult, Parsed, StrftimeItems};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use thiserror::Error;
 use tokio_postgres::types::{Kind, Type};
@@ -43,6 +46,13 @@ pub enum FromTextError {
     #[error("invalid timestamp: {0} ")]
     InvalidTimestamp(#[from] chrono::ParseError),
 
+    /// Iceberg dates and timestamps have no infinite values; mirrors store only finite ones.
+    #[error("'{0}' (infinite date or timestamp) cannot be stored")]
+    InfiniteDateTime(String),
+
+    #[error("invalid date or timestamp '{0}'")]
+    InvalidDateTime(String),
+
     #[error("invalid array: {0}")]
     InvalidArray(#[from] ArrayParseError),
 
@@ -55,6 +65,83 @@ pub enum FromTextError {
 
 pub struct TextFormatConverter;
 
+/// Postgres prints dates (ISO DateStyle) as `YYYY-MM-DD`, with more year digits after 9999 and a
+/// ` BC` suffix before year 1; chrono uses astronomical years (1 BC is year 0) and wants a sign on
+/// years beyond four digits. Returns the text with the year rewritten for chrono.
+fn chrono_date_text(text: &str) -> Result<Cow<'_, str>, FromTextError> {
+    // Years 1 to 9999, nearly every value, read the same in chrono without a sign. Borrowing them
+    // keeps an allocation off every date and timestamp a copy converts.
+    let bytes = text.as_bytes();
+    if bytes.len() > 4
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && !text.ends_with(" BC")
+    {
+        return Ok(Cow::Borrowed(text));
+    }
+    if matches!(text, "infinity" | "-infinity") {
+        return Err(FromTextError::InfiniteDateTime(text.to_string()));
+    }
+    let (text, bc) = match text.strip_suffix(" BC") {
+        Some(rest) => (rest, true),
+        None => (text, false),
+    };
+    let digits = text.find('-').unwrap_or(text.len());
+    let year: i32 = text[..digits]
+        .parse()
+        .map_err(|_| FromTextError::InvalidDateTime(text.to_string()))?;
+    let year = if bc { 1 - year } else { year };
+    Ok(Cow::Owned(format!("{year:+05}{}", &text[digits..])))
+}
+
+/// chrono's items for a format string. Parsed once into these statics: `parse_from_str` parses
+/// its format string again for every value, which costs more than reading the value.
+type ChronoFormat = LazyLock<Vec<Item<'static>>>;
+
+fn chrono_format(format: &'static str) -> Vec<Item<'static>> {
+    StrftimeItems::new(format)
+        .parse()
+        .expect("valid chrono format")
+}
+
+static DATE_FORMAT: ChronoFormat = LazyLock::new(|| chrono_format("%Y-%m-%d"));
+static TIME_FORMAT: ChronoFormat = LazyLock::new(|| chrono_format("%H:%M:%S%.f"));
+static TIMESTAMP_FORMAT: ChronoFormat = LazyLock::new(|| chrono_format("%Y-%m-%d %H:%M:%S%.f"));
+static TIMESTAMPTZ_FORMAT: ChronoFormat =
+    LazyLock::new(|| chrono_format("%Y-%m-%d %H:%M:%S%.f%#z"));
+static TIMESTAMPTZ_COLON_FORMAT: ChronoFormat =
+    LazyLock::new(|| chrono_format("%Y-%m-%d %H:%M:%S%.f%:z"));
+
+/// What `parse_from_str` reads before converting: the fields of `text` in `format`.
+fn parse_fields(format: &ChronoFormat, text: &str) -> ParseResult<Parsed> {
+    let mut parsed = Parsed::new();
+    chrono::format::parse(&mut parsed, text, format.iter())?;
+    Ok(parsed)
+}
+
+pub(crate) fn parse_date(text: &str) -> Result<NaiveDate, FromTextError> {
+    Ok(parse_fields(&DATE_FORMAT, &chrono_date_text(text)?)?.to_naive_date()?)
+}
+
+fn parse_time(text: &str) -> Result<NaiveTime, FromTextError> {
+    Ok(parse_fields(&TIME_FORMAT, text)?.to_naive_time()?)
+}
+
+pub(crate) fn parse_timestamp(text: &str) -> Result<NaiveDateTime, FromTextError> {
+    // No offset adjustment, as in NaiveDateTime::parse_from_str.
+    Ok(parse_fields(&TIMESTAMP_FORMAT, &chrono_date_text(text)?)?
+        .to_naive_datetime_with_offset(0)?)
+}
+
+pub(crate) fn parse_timestamptz(text: &str) -> Result<DateTime<Utc>, FromTextError> {
+    let text = chrono_date_text(text)?;
+    let value = match parse_fields(&TIMESTAMPTZ_FORMAT, &text).and_then(|p| p.to_datetime()) {
+        Ok(value) => value,
+        Err(_) => parse_fields(&TIMESTAMPTZ_COLON_FORMAT, &text)?.to_datetime()?,
+    };
+    Ok(value.into())
+}
+
 #[derive(Debug, Error)]
 pub enum ArrayParseError {
     #[error("input too short")]
@@ -62,6 +149,10 @@ pub enum ArrayParseError {
 
     #[error("missing braces")]
     MissingBraces,
+
+    /// Mirrors store one-dimensional arrays with default bounds only.
+    #[error("multi-dimensional arrays and arrays with explicit bounds are not supported")]
+    NotOneDimensional,
 }
 
 #[derive(Debug, Error)]
@@ -124,71 +215,56 @@ impl TextFormatConverter {
                     | Type::OID
                     | Type::OID_ARRAY
             ),
-            Kind::Array(_) => true,
-            Kind::Composite(_) => true,
+            // Arrays (all Kind::Array, so not matched above) are parsed when their element type
+            // is: the types above each have an array arm, composites are parsed element-wise.
+            // Composites need every field to be supported.
+            Kind::Array(inner) => match inner.kind() {
+                // Parsed as an array of the base type (or of text), which needs one built in.
+                Kind::Domain(_) | Kind::Enum(_) => Self::array_of_element(inner)
+                    .is_some_and(|array| Self::is_supported_type(&array)),
+                _ => Self::is_supported_type(inner),
+            },
+            Kind::Composite(fields) => fields.iter().all(|f| Self::is_supported_type(f.type_())),
+            Kind::Domain(base) => Self::is_supported_type(base),
+            Kind::Enum(_) => true,
             _ => false,
         }
     }
 
-    pub fn default_value(typ: &Type) -> Cell {
-        match *typ {
-            Type::BOOL => Cell::Bool(bool::default()),
-            Type::BOOL_ARRAY => Cell::Array(ArrayCell::Bool(Vec::default())),
-            Type::CHAR | Type::BPCHAR | Type::VARCHAR | Type::NAME | Type::TEXT => {
-                Cell::String(String::default())
-            }
-            Type::CHAR_ARRAY
-            | Type::BPCHAR_ARRAY
-            | Type::VARCHAR_ARRAY
-            | Type::NAME_ARRAY
-            | Type::TEXT_ARRAY => Cell::Array(ArrayCell::String(Vec::default())),
-            Type::INT2 => Cell::I16(i16::default()),
-            Type::INT2_ARRAY => Cell::Array(ArrayCell::I16(Vec::default())),
-            Type::INT4 => Cell::I32(i32::default()),
-            Type::INT4_ARRAY => Cell::Array(ArrayCell::I32(Vec::default())),
-            Type::INT8 => Cell::I64(i64::default()),
-            Type::INT8_ARRAY => Cell::Array(ArrayCell::I64(Vec::default())),
-            Type::FLOAT4 => Cell::F32(f32::default()),
-            Type::FLOAT4_ARRAY => Cell::Array(ArrayCell::F32(Vec::default())),
-            Type::FLOAT8 => Cell::F64(f64::default()),
-            Type::FLOAT8_ARRAY => Cell::Array(ArrayCell::F64(Vec::default())),
-            Type::NUMERIC => Cell::Numeric(PgNumeric::default()),
-            Type::NUMERIC_ARRAY => Cell::Array(ArrayCell::Numeric(Vec::default())),
-            Type::BYTEA => Cell::Bytes(Vec::default()),
-            Type::BYTEA_ARRAY => Cell::Array(ArrayCell::Bytes(Vec::default())),
-            Type::DATE => Cell::Date(NaiveDate::MIN),
-            Type::DATE_ARRAY => Cell::Array(ArrayCell::Date(Vec::default())),
-            Type::TIME => Cell::Time(NaiveTime::MIN),
-            Type::TIME_ARRAY => Cell::Array(ArrayCell::Time(Vec::default())),
-            Type::TIMESTAMP => Cell::TimeStamp(NaiveDateTime::MIN),
-            Type::TIMESTAMP_ARRAY => Cell::Array(ArrayCell::TimeStamp(Vec::default())),
-            Type::TIMESTAMPTZ => {
-                let val = DateTime::<Utc>::from_naive_utc_and_offset(NaiveDateTime::MIN, Utc);
-                Cell::TimeStampTz(val)
-            }
-            Type::TIMESTAMPTZ_ARRAY => Cell::Array(ArrayCell::TimeStampTz(Vec::default())),
-            Type::UUID => Cell::Uuid(Uuid::default()),
-            Type::UUID_ARRAY => Cell::Array(ArrayCell::Uuid(Vec::default())),
-            Type::JSON | Type::JSONB => Cell::Json(serde_json::Value::default()),
-            Type::JSON_ARRAY | Type::JSONB_ARRAY => Cell::Array(ArrayCell::Json(Vec::default())),
-            Type::OID => Cell::U32(u32::default()),
-            Type::OID_ARRAY => Cell::Array(ArrayCell::U32(Vec::default())),
-            _ => match typ.kind() {
-                Kind::Composite(_) => Cell::Composite(Vec::default()),
-                Kind::Array(inner_type) => {
-                    // Handle arrays of composite types.
-                    // Note: inner_type here refers to the element type of the array.
-                    // PostgreSQL supports multi-dimensional arrays (e.g., text[][]),
-                    // but we currently only handle arrays of composite types here.
-                    match inner_type.kind() {
-                        Kind::Composite(_) => Cell::Array(ArrayCell::Composite(Vec::default())),
-                        Kind::Array(_) => Cell::Null, // TODO: Multi-dimensional arrays not yet handled
-                        _ => Cell::Null,              // Unknown array type
-                    }
-                }
-                _ => Cell::Null,
-            },
+    /// The built-in array type to parse an array of domain or enum values with: an array of the
+    /// domain's base type, or of text for an enum.
+    fn array_of_element(element: &Type) -> Option<Type> {
+        let mut element = element;
+        while let Kind::Domain(base) = element.kind() {
+            element = base;
         }
+        if matches!(element.kind(), Kind::Enum(_)) {
+            return Some(Type::TEXT_ARRAY);
+        }
+        Some(match *element {
+            Type::BOOL => Type::BOOL_ARRAY,
+            Type::CHAR => Type::CHAR_ARRAY,
+            Type::BPCHAR => Type::BPCHAR_ARRAY,
+            Type::VARCHAR => Type::VARCHAR_ARRAY,
+            Type::NAME => Type::NAME_ARRAY,
+            Type::TEXT => Type::TEXT_ARRAY,
+            Type::INT2 => Type::INT2_ARRAY,
+            Type::INT4 => Type::INT4_ARRAY,
+            Type::INT8 => Type::INT8_ARRAY,
+            Type::FLOAT4 => Type::FLOAT4_ARRAY,
+            Type::FLOAT8 => Type::FLOAT8_ARRAY,
+            Type::NUMERIC => Type::NUMERIC_ARRAY,
+            Type::BYTEA => Type::BYTEA_ARRAY,
+            Type::DATE => Type::DATE_ARRAY,
+            Type::TIME => Type::TIME_ARRAY,
+            Type::TIMESTAMP => Type::TIMESTAMP_ARRAY,
+            Type::TIMESTAMPTZ => Type::TIMESTAMPTZ_ARRAY,
+            Type::UUID => Type::UUID_ARRAY,
+            Type::JSON => Type::JSON_ARRAY,
+            Type::JSONB => Type::JSONB_ARRAY,
+            Type::OID => Type::OID_ARRAY,
+            _ => return None,
+        })
     }
 
     pub fn try_from_str(typ: &Type, str: &str) -> Result<Cell, FromTextError> {
@@ -199,14 +275,18 @@ impl TextFormatConverter {
                 |str| Ok(Some(parse_bool(str)?)),
                 ArrayCell::Bool,
             ),
-            Type::CHAR | Type::BPCHAR => Ok(Cell::String(str.trim_end().to_string())),
-            Type::VARCHAR | Type::NAME | Type::TEXT => Ok(Cell::String(str.to_string())),
-            Type::CHAR_ARRAY | Type::BPCHAR_ARRAY => TextFormatConverter::parse_array(
+            // character(n) pads with spaces, which (as in its cast to text) are not part of the
+            // value; any other trailing character is.
+            Type::BPCHAR => Ok(Cell::String(str.trim_end_matches(' ').to_string())),
+            Type::CHAR | Type::VARCHAR | Type::NAME | Type::TEXT => {
+                Ok(Cell::String(str.to_string()))
+            }
+            Type::BPCHAR_ARRAY => TextFormatConverter::parse_array(
                 str,
-                |str| Ok(Some(str.trim_end().to_string())),
+                |str| Ok(Some(str.trim_end_matches(' ').to_string())),
                 ArrayCell::String,
             ),
-            Type::VARCHAR_ARRAY | Type::NAME_ARRAY | Type::TEXT_ARRAY => {
+            Type::CHAR_ARRAY | Type::VARCHAR_ARRAY | Type::NAME_ARRAY | Type::TEXT_ARRAY => {
                 TextFormatConverter::parse_array(
                     str,
                     |str| Ok(Some(str.to_string())),
@@ -245,78 +325,30 @@ impl TextFormatConverter {
                 |str| Ok(Some(hex::from_bytea_hex(str)?)),
                 ArrayCell::Bytes,
             ),
-            Type::DATE => {
-                let val = NaiveDate::parse_from_str(str, "%Y-%m-%d")?;
-                Ok(Cell::Date(val))
-            }
+            Type::DATE => Ok(Cell::Date(parse_date(str)?)),
             Type::DATE_ARRAY => TextFormatConverter::parse_array(
                 str,
-                |str| Ok(Some(NaiveDate::parse_from_str(str, "%Y-%m-%d")?)),
+                |str| Ok(Some(parse_date(str)?)),
                 ArrayCell::Date,
             ),
-            Type::TIME => {
-                let val = NaiveTime::parse_from_str(str, "%H:%M:%S%.f")?;
-                Ok(Cell::Time(val))
-            }
+            Type::TIME => Ok(Cell::Time(parse_time(str)?)),
             Type::TIME_ARRAY => TextFormatConverter::parse_array(
                 str,
-                |str| Ok(Some(NaiveTime::parse_from_str(str, "%H:%M:%S%.f")?)),
+                |str| Ok(Some(parse_time(str)?)),
                 ArrayCell::Time,
             ),
-            Type::TIMESTAMP => {
-                let val = NaiveDateTime::parse_from_str(str, "%Y-%m-%d %H:%M:%S%.f")?;
-                Ok(Cell::TimeStamp(val))
-            }
+            Type::TIMESTAMP => Ok(Cell::TimeStamp(parse_timestamp(str)?)),
             Type::TIMESTAMP_ARRAY => TextFormatConverter::parse_array(
                 str,
-                |str| {
-                    Ok(Some(NaiveDateTime::parse_from_str(
-                        str,
-                        "%Y-%m-%d %H:%M:%S%.f",
-                    )?))
-                },
+                |str| Ok(Some(parse_timestamp(str)?)),
                 ArrayCell::TimeStamp,
             ),
-            Type::TIMESTAMPTZ => {
-                let val =
-                    match DateTime::<FixedOffset>::parse_from_str(str, "%Y-%m-%d %H:%M:%S%.f%#z") {
-                        Ok(val) => val,
-                        Err(_) => {
-                            DateTime::<FixedOffset>::parse_from_str(str, "%Y-%m-%d %H:%M:%S%.f%:z")?
-                        }
-                    };
-                Ok(Cell::TimeStampTz(val.into()))
-            }
-            Type::TIMESTAMPTZ_ARRAY => {
-                match TextFormatConverter::parse_array(
-                    str,
-                    |str| {
-                        Ok(Some(
-                            DateTime::<FixedOffset>::parse_from_str(
-                                str,
-                                "%Y-%m-%d %H:%M:%S%.f%#z",
-                            )?
-                            .into(),
-                        ))
-                    },
-                    ArrayCell::TimeStampTz,
-                ) {
-                    Ok(val) => Ok(val),
-                    Err(_) => TextFormatConverter::parse_array(
-                        str,
-                        |str| {
-                            Ok(Some(
-                                DateTime::<FixedOffset>::parse_from_str(
-                                    str,
-                                    "%Y-%m-%d %H:%M:%S%.f%:z",
-                                )?
-                                .into(),
-                            ))
-                        },
-                        ArrayCell::TimeStampTz,
-                    ),
-                }
-            }
+            Type::TIMESTAMPTZ => Ok(Cell::TimeStampTz(parse_timestamptz(str)?)),
+            Type::TIMESTAMPTZ_ARRAY => TextFormatConverter::parse_array(
+                str,
+                |str| Ok(Some(parse_timestamptz(str)?)),
+                ArrayCell::TimeStampTz,
+            ),
             Type::UUID => {
                 let val = Uuid::parse_str(str)?;
                 Ok(Cell::Uuid(val))
@@ -326,13 +358,10 @@ impl TextFormatConverter {
                 |str| Ok(Some(Uuid::parse_str(str)?)),
                 ArrayCell::Uuid,
             ),
-            Type::JSON | Type::JSONB => {
-                let val = serde_json::from_str(str)?;
-                Ok(Cell::Json(val))
-            }
+            Type::JSON | Type::JSONB => Ok(Cell::Json(str.to_string())),
             Type::JSON_ARRAY | Type::JSONB_ARRAY => TextFormatConverter::parse_array(
                 str,
-                |str| Ok(Some(serde_json::from_str(str)?)),
+                |str| Ok(Some(str.to_string())),
                 ArrayCell::Json,
             ),
             Type::OID => {
@@ -343,7 +372,17 @@ impl TextFormatConverter {
                 TextFormatConverter::parse_array(str, |str| Ok(Some(str.parse()?)), ArrayCell::U32)
             }
             _ => match typ.kind() {
+                Kind::Domain(base) => TextFormatConverter::try_from_str(base, str),
+                Kind::Enum(_) => Ok(Cell::String(str.to_string())),
                 Kind::Composite(fields) => TextFormatConverter::parse_composite(str, fields),
+                Kind::Array(inner_type)
+                    if matches!(inner_type.kind(), Kind::Domain(_) | Kind::Enum(_)) =>
+                {
+                    match TextFormatConverter::array_of_element(inner_type) {
+                        Some(array) => TextFormatConverter::try_from_str(&array, str),
+                        None => Err(FromTextError::InvalidConversion(typ.to_string())),
+                    }
+                }
                 Kind::Array(inner_type) => {
                     // Check if the array contains composite types.
                     // PostgreSQL supports multi-dimensional arrays (e.g., int[][], text[][]),
@@ -374,6 +413,10 @@ impl TextFormatConverter {
             return Err(ArrayParseError::InputTooShort.into());
         }
 
+        // Postgres prefixes arrays with non-default bounds with their dimensions: '[0:1]={1,2}'.
+        if str.starts_with('[') {
+            return Err(ArrayParseError::NotOneDimensional.into());
+        }
         if !str.starts_with('{') || !str.ends_with('}') {
             return Err(ArrayParseError::MissingBraces.into());
         }
@@ -414,6 +457,11 @@ impl TextFormatConverter {
                         '\\' => in_escape = true,
                         ',' if !in_quotes => {
                             break;
+                        }
+                        // Element values containing braces are quoted, so an unquoted brace
+                        // opens or closes a nested dimension ('{{1,2},{3,4}}').
+                        '{' | '}' if !in_quotes => {
+                            return Err(ArrayParseError::NotOneDimensional.into());
                         }
                         c => {
                             val_str.push(c);
@@ -570,6 +618,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn arrays_that_are_not_one_dimensional_are_rejected() {
+        for (typ, text) in [
+            (Type::INT4_ARRAY, "{{1,2},{3,4}}"),
+            (Type::TEXT_ARRAY, "{{a,b},{c,d}}"),
+            (Type::INT4_ARRAY, "[0:1]={1,2}"),
+            (Type::TEXT_ARRAY, "[2:2]={x}"),
+        ] {
+            assert!(
+                matches!(
+                    TextFormatConverter::try_from_str(&typ, text),
+                    Err(FromTextError::InvalidArray(
+                        ArrayParseError::NotOneDimensional
+                    ))
+                ),
+                "{typ} {text}"
+            );
+        }
+        // Braces inside quoted elements are data, not dimensions.
+        match TextFormatConverter::try_from_str(&Type::TEXT_ARRAY, r#"{"{a","b}"}"#).unwrap() {
+            Cell::Array(ArrayCell::String(values)) => {
+                assert_eq!(values, vec![Some("{a".to_string()), Some("b}".to_string())])
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_text_array_quoted_null_as_string() {
         let cell =
             TextFormatConverter::try_from_str(&Type::TEXT_ARRAY, "{\"a\",\"null\"}").unwrap();
@@ -594,16 +669,22 @@ mod tests {
 
     #[test]
     fn parse_char_vs_varchar_trailing_spaces() {
-        // CHAR/BPCHAR should trim trailing spaces
-        let char_cell = TextFormatConverter::try_from_str(&Type::CHAR, "hello   ").unwrap();
+        // Type::CHAR is the one-byte "char" type, which is never padded: a space is its value.
+        let char_cell = TextFormatConverter::try_from_str(&Type::CHAR, " ").unwrap();
         match char_cell {
-            Cell::String(s) => assert_eq!(s, "hello"),
+            Cell::String(s) => assert_eq!(s, " "),
             _ => panic!("expected string cell, got: {char_cell:?}"),
         }
 
+        // character(n) (BPCHAR) drops its space padding, but nothing else.
         let bpchar_cell = TextFormatConverter::try_from_str(&Type::BPCHAR, "world   ").unwrap();
         match bpchar_cell {
             Cell::String(s) => assert_eq!(s, "world"),
+            _ => panic!("expected string cell, got: {bpchar_cell:?}"),
+        }
+        let bpchar_cell = TextFormatConverter::try_from_str(&Type::BPCHAR, "a\t  ").unwrap();
+        match bpchar_cell {
+            Cell::String(s) => assert_eq!(s, "a\t"),
             _ => panic!("expected string cell, got: {bpchar_cell:?}"),
         }
 
@@ -623,9 +704,9 @@ mod tests {
 
     #[test]
     fn parse_char_array_vs_varchar_array_trailing_spaces() {
-        // CHAR_ARRAY/BPCHAR_ARRAY should trim trailing spaces
+        // character(n)[] (BPCHAR_ARRAY) drops the elements' space padding
         let char_array_cell =
-            TextFormatConverter::try_from_str(&Type::CHAR_ARRAY, "{\"hello   \",\"world   \"}")
+            TextFormatConverter::try_from_str(&Type::BPCHAR_ARRAY, "{\"hello   \",\"world   \"}")
                 .unwrap();
         match char_array_cell {
             Cell::Array(ArrayCell::String(v)) => {
@@ -633,6 +714,16 @@ mod tests {
                     v,
                     vec![Some("hello".to_string()), Some("world".to_string())]
                 );
+            }
+            _ => panic!("expected string array cell, got: {char_array_cell:?}"),
+        }
+
+        // \"char\"[] elements are single characters, a space included
+        let char_array_cell =
+            TextFormatConverter::try_from_str(&Type::CHAR_ARRAY, "{\" \",a}").unwrap();
+        match char_array_cell {
+            Cell::Array(ArrayCell::String(v)) => {
+                assert_eq!(v, vec![Some(" ".to_string()), Some("a".to_string())]);
             }
             _ => panic!("expected string array cell, got: {char_array_cell:?}"),
         }
@@ -1119,5 +1210,263 @@ mod tests {
                 CompositeParseError::FieldCountMismatch
             ))
         ));
+    }
+
+    #[test]
+    fn dates_outside_years_1_to_9999_keep_their_value() {
+        use chrono::Datelike;
+        assert_eq!(
+            parse_date("2020-01-02").unwrap(),
+            NaiveDate::from_ymd_opt(2020, 1, 2).unwrap()
+        );
+        // 2040 BC is astronomical year -2039.
+        assert_eq!(
+            parse_date("2040-04-10 BC").unwrap(),
+            NaiveDate::from_ymd_opt(-2039, 4, 10).unwrap()
+        );
+        assert_eq!(parse_date("0001-01-01 BC").unwrap().year(), 0);
+        assert_eq!(
+            parse_date("10000-01-01").unwrap(),
+            NaiveDate::from_ymd_opt(10000, 1, 1).unwrap()
+        );
+        assert_eq!(
+            parse_timestamp("2040-04-10 12:00:00.5 BC").unwrap(),
+            NaiveDate::from_ymd_opt(-2039, 4, 10)
+                .unwrap()
+                .and_hms_milli_opt(12, 0, 0, 500)
+                .unwrap()
+        );
+        assert_eq!(
+            parse_timestamp("12345-06-07 01:02:03").unwrap(),
+            NaiveDate::from_ymd_opt(12345, 6, 7)
+                .unwrap()
+                .and_hms_opt(1, 2, 3)
+                .unwrap()
+        );
+        assert_eq!(
+            parse_timestamptz("10000-03-12 23:58:48+05:30").unwrap(),
+            NaiveDate::from_ymd_opt(10000, 3, 12)
+                .unwrap()
+                .and_hms_opt(18, 28, 48)
+                .unwrap()
+                .and_utc()
+        );
+        assert_eq!(
+            parse_timestamptz("0044-03-15 12:00:00+00 BC").unwrap(),
+            NaiveDate::from_ymd_opt(-43, 3, 15)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_utc()
+        );
+        assert_eq!(
+            parse_timestamptz("2020-01-01 00:00:00-08").unwrap(),
+            NaiveDate::from_ymd_opt(2020, 1, 1)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap()
+                .and_utc()
+        );
+    }
+
+    #[test]
+    fn only_years_chrono_reads_differently_are_rewritten() {
+        for text in [
+            "2020-01-02",
+            "0001-01-01",
+            "9999-12-31 23:59:59.999999",
+            "2020-01-01 00:00:00-08",
+            "0044-03-15 12:00:00+05:30",
+        ] {
+            assert!(
+                matches!(chrono_date_text(text).unwrap(), Cow::Borrowed(t) if t == text),
+                "{text}"
+            );
+        }
+        for (text, rewritten) in [
+            ("2040-04-10 BC", "-2039-04-10"),
+            ("0001-01-01 BC", "+0000-01-01"),
+            ("10000-01-01", "+10000-01-01"),
+            ("12345-06-07 01:02:03", "+12345-06-07 01:02:03"),
+            ("0044-03-15 12:00:00+00 BC", "-0043-03-15 12:00:00+00"),
+        ] {
+            assert!(
+                matches!(chrono_date_text(text).unwrap(), Cow::Owned(t) if t == rewritten),
+                "{text}"
+            );
+        }
+    }
+
+    /// The date, time and timestamp parsers as they were: every year rewritten for chrono, and
+    /// chrono's format strings parsed for each value.
+    mod reference {
+        use super::*;
+
+        fn chrono_date_text(text: &str) -> Result<String, FromTextError> {
+            if matches!(text, "infinity" | "-infinity") {
+                return Err(FromTextError::InfiniteDateTime(text.to_string()));
+            }
+            let (text, bc) = match text.strip_suffix(" BC") {
+                Some(rest) => (rest, true),
+                None => (text, false),
+            };
+            let digits = text.find('-').unwrap_or(text.len());
+            let year: i32 = text[..digits]
+                .parse()
+                .map_err(|_| FromTextError::InvalidDateTime(text.to_string()))?;
+            let year = if bc { 1 - year } else { year };
+            Ok(format!("{year:+05}{}", &text[digits..]))
+        }
+
+        pub fn parse_date(text: &str) -> Result<NaiveDate, FromTextError> {
+            Ok(NaiveDate::parse_from_str(
+                &chrono_date_text(text)?,
+                "%Y-%m-%d",
+            )?)
+        }
+
+        pub fn parse_timestamp(text: &str) -> Result<NaiveDateTime, FromTextError> {
+            Ok(NaiveDateTime::parse_from_str(
+                &chrono_date_text(text)?,
+                "%Y-%m-%d %H:%M:%S%.f",
+            )?)
+        }
+
+        pub fn parse_time(text: &str) -> Result<NaiveTime, FromTextError> {
+            Ok(NaiveTime::parse_from_str(text, "%H:%M:%S%.f")?)
+        }
+
+        pub fn parse_timestamptz(text: &str) -> Result<DateTime<Utc>, FromTextError> {
+            let text = chrono_date_text(text)?;
+            let value =
+                match DateTime::<FixedOffset>::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f%#z") {
+                    Ok(value) => value,
+                    Err(_) => {
+                        DateTime::<FixedOffset>::parse_from_str(&text, "%Y-%m-%d %H:%M:%S%.f%:z")?
+                    }
+                };
+            Ok(value.into())
+        }
+    }
+
+    #[test]
+    fn dates_times_and_timestamps_parse_as_before() {
+        let dates = [
+            "2020-01-02",
+            "0000-01-01",
+            "0001-01-01",
+            "9999-12-31",
+            "2024-02-29",
+            "2023-02-29",
+            "2024-13-01",
+            "2024-1-1",
+            "2024-01-01x",
+            "2024-",
+            "2024",
+            "20240101",
+            "abcd-01-01",
+            "12-01-01",
+            "",
+            "-",
+            "-2024-01-01",
+            "+2024-01-01",
+            " 2024-01-01",
+            "2024-01-01 BC",
+            "2024-01-01 bc",
+            "2040-04-10 BC",
+            "10000-01-01",
+            "5874897-12-31",
+            "99999999999-01-01",
+            "infinity",
+            "-infinity",
+            "２０２４-01-01",
+        ];
+        let times = [
+            "",
+            " 00:00:00",
+            " 23:59:59.999999",
+            " 12:34:56.5",
+            " 24:00:00",
+            " 12:60:00",
+            " 12:00",
+            " 12:00:00.",
+            "T12:00:00",
+        ];
+        let zones = [
+            "",
+            "+00",
+            "-08",
+            "+05:30",
+            "+0530",
+            "+14",
+            "-12:45:30",
+            "Z",
+            " UTC",
+        ];
+        let suffixes = ["", " BC"];
+        for time in times {
+            let time = time.trim_start_matches([' ', 'T']);
+            for suffix in ["", "x", ".000001", "+00"] {
+                let text = format!("{time}{suffix}");
+                assert_eq!(
+                    format!("{:?}", parse_time(&text)),
+                    format!("{:?}", reference::parse_time(&text)),
+                    "{text}"
+                );
+            }
+        }
+        for date in dates {
+            assert_eq!(
+                format!("{:?}", parse_date(date)),
+                format!("{:?}", reference::parse_date(date)),
+                "{date}"
+            );
+            for time in times {
+                for zone in zones {
+                    for suffix in suffixes {
+                        let text = format!("{date}{time}{zone}{suffix}");
+                        assert_eq!(
+                            format!("{:?}", parse_timestamp(&text)),
+                            format!("{:?}", reference::parse_timestamp(&text)),
+                            "{text}"
+                        );
+                        assert_eq!(
+                            format!("{:?}", parse_timestamptz(&text)),
+                            format!("{:?}", reference::parse_timestamptz(&text)),
+                            "{text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn infinite_and_unrepresentable_dates_are_errors() {
+        for text in ["infinity", "-infinity"] {
+            assert!(matches!(
+                parse_date(text),
+                Err(FromTextError::InfiniteDateTime(_))
+            ));
+            assert!(matches!(
+                parse_timestamp(text),
+                Err(FromTextError::InfiniteDateTime(_))
+            ));
+            assert!(matches!(
+                parse_timestamptz(text),
+                Err(FromTextError::InfiniteDateTime(_))
+            ));
+        }
+        // Postgres dates reach year 5874897, beyond chrono's range.
+        assert!(parse_date("5874897-12-31").is_err());
+        // Malformed text names itself.
+        assert!(
+            matches!(parse_date("20x0-01-01"), Err(FromTextError::InvalidDateTime(t)) if t == "20x0-01-01")
+        );
+        assert!(matches!(
+            parse_timestamp("99999999999-01-01 00:00:00"),
+            Err(FromTextError::InvalidDateTime(_))
+        ));
+        assert!(parse_timestamp("294276-12-31 23:59:59").is_err());
     }
 }

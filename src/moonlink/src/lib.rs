@@ -8,31 +8,28 @@ mod storage;
 pub(crate) mod table_handler;
 pub mod table_handler_timer;
 pub(crate) mod table_notify;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_hooks;
 mod union_read;
 
 pub use error::*;
-pub use event_sync::EventSyncSender;
+pub use event_sync::{EventSyncSender, TableStatus};
 pub use lsn_state::{CommitState, ReplicationState};
 pub use mooncake_table_id::MooncakeTableId;
 pub use storage::mooncake_table::batch_id_counter::BatchIdCounter;
 pub use storage::mooncake_table::data_batches::ColumnStoreBuffer;
 pub use storage::parquet_utils::get_default_parquet_properties;
 pub use storage::storage_utils::create_data_file;
-#[cfg(all(feature = "catalog-glue", feature = "storage-s3"))]
-pub use storage::IcebergGlueCatalogConfig;
-#[cfg(feature = "catalog-rest")]
-pub use storage::IcebergRestCatalogConfig;
 pub(crate) use storage::NonEvictableHandle;
 pub use storage::{
-    AccessorConfig, AwsSecurityConfig, BaseFileSystemAccess, BaseIcebergSnapshotFetcher,
-    CacheTrait, CloudSecurityConfig, DataCompactionConfig, DiskSliceWriterConfig,
-    EventSyncReceiver, FileIndexMergeConfig, FileSystemAccessor, FsChaosConfig, FsRetryConfig,
-    FsThrottleConfig, FsTimeoutConfig, IcebergCatalogConfig, IcebergFileCatalogConfig,
-    IcebergPersistenceConfig, IcebergSnapshotFetcher, IcebergTableConfig, IcebergTableManager,
-    MooncakeTable, MooncakeTableConfig, MoonlinkSecretType, MoonlinkTableConfig,
-    MoonlinkTableSecret, ObjectStorageCache, ObjectStorageCacheConfig, PersistentWalMetadata,
+    AccessorConfig, BaseFileSystemAccess, BaseIcebergSnapshotFetcher, CacheTrait,
+    DataCompactionConfig, DiskSliceWriterConfig, EventSyncReceiver, FileIndexMergeConfig,
+    FileSystemAccessor, FsChaosConfig, FsRetryConfig, FsThrottleConfig, FsTimeoutConfig,
+    IcebergCatalogConfig, IcebergFileCatalogConfig, IcebergPersistenceConfig,
+    IcebergSnapshotFetcher, IcebergTableConfig, IcebergTableManager, MooncakeTable,
+    MooncakeTableConfig, MoonlinkTableConfig, ObjectStorageCache, ObjectStorageCacheConfig,
     SnapshotReadOutput, StorageConfig, TableEventManager, TableManager, TableSnapshotStatus,
-    TableStatusReader, WalConfig, WalManager, WalTransactionState,
+    TableStatusReader,
 };
 pub use table_handler::TableHandler;
 pub use table_handler_timer::TableHandlerTimer;

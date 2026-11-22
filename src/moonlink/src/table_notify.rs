@@ -7,7 +7,6 @@ use crate::storage::mooncake_table::FileIndiceMergePayload;
 use crate::storage::mooncake_table::FileIndiceMergeResult;
 use crate::storage::mooncake_table::PersistenceSnapshotPayload;
 use crate::storage::mooncake_table::PersistenceSnapshotResult;
-use crate::storage::wal::WalPersistenceUpdateResult;
 use crate::Result;
 use crate::StorageConfig;
 
@@ -76,7 +75,6 @@ pub enum TableEvent {
         row: MoonlinkRow,
         xact_id: Option<u32>,
         lsn: u64,
-        is_recovery: bool,
     },
     /// Delete a row from the table
     Delete {
@@ -84,23 +82,11 @@ pub enum TableEvent {
         lsn: u64,
         xact_id: Option<u32>,
         delete_if_exists: bool,
-        is_recovery: bool,
     },
     /// Commit all pending operations with a given LSN and xact_id
-    Commit {
-        lsn: u64,
-        xact_id: Option<u32>,
-        is_recovery: bool,
-    },
+    Commit { lsn: u64, xact_id: Option<u32> },
     /// Abort current stream with given xact_id
-    /// If closes incomplete wal transaction is true, then this is being used during recovery
-    /// to close any incomplete transactions in the WAL that are now discarded as we will replay them from the source instead.
-    /// Note that in this case, is_recovery will be set to false as we want the event to be persisted into the WAL.
-    StreamAbort {
-        xact_id: u32,
-        is_recovery: bool,
-        closes_incomplete_wal_transaction: bool,
-    },
+    StreamAbort { xact_id: u32 },
     FlushResult {
         /// Background event id.
         event_id: uuid::Uuid,
@@ -128,16 +114,9 @@ pub enum TableEvent {
     /// ==============================
     ///
     /// Commit and flush the table to disk
-    CommitFlush {
-        lsn: u64,
-        xact_id: Option<u32>,
-        is_recovery: bool,
-    },
+    CommitFlush { lsn: u64, xact_id: Option<u32> },
     /// Flush the transaction stream with given xact_id
-    StreamFlush {
-        xact_id: u32,
-        is_recovery: bool,
-    },
+    StreamFlush { xact_id: u32 },
 
     /// ==============================
     /// Interactive blocking events
@@ -145,9 +124,7 @@ pub enum TableEvent {
     ///
     /// Force a mooncake and iceberg snapshot.
     /// - If [`lsn`] unassigned, will force snapshot on the latest committed LSN.
-    ForceSnapshot {
-        lsn: Option<u64>,
-    },
+    ForceSnapshot { lsn: Option<u64> },
     /// There's at most one outstanding force table maintenance requests.
     ///
     /// Force a regular index merge operation.
@@ -158,18 +135,37 @@ pub enum TableEvent {
     ForceFullMaintenance,
     /// Drop table.
     DropTable,
+    /// Put the table into the errored state (requested by any layer, e.g. CDC).
+    EnterErrored { reason: String },
+    /// Every change up to `lsn` has been delivered to this table (all earlier events for it are
+    /// ahead of this one in its channel). Lets a table with nothing left to persist report `lsn`
+    /// as its flush LSN, so it does not hold the replication slot back.
+    ReplicationProgress { lsn: u64 },
+    /// Internal: an errored table stopped waiting for in-flight background tasks before dropping.
+    ErroredDropTimeout,
+    /// Internal: a background task of the table panicked.
+    BackgroundTaskFailed { task: &'static str, message: String },
+    /// Test-only: make the event loop panic.
+    #[cfg(test)]
+    PanicForTest,
+    /// Test-only: how long an errored table waits for background tasks before dropping.
+    #[cfg(test)]
+    SetErroredDropWaitForTest { wait: std::time::Duration },
+    /// Test-only: make the table's handler task die (panic), like an unexpected crash.
+    #[cfg(any(test, feature = "test-utils"))]
+    KillForTest,
+    /// Test-only: how long garbage collection keeps superseded files when no read path reports
+    /// live readers (harnesses that drive a table handler without a ReadStateManager).
+    #[cfg(test)]
+    SetGcGraceForTest { grace: std::time::Duration },
     /// Alter table,
-    AlterTable {
-        columns_to_drop: Vec<String>,
-    },
+    AlterTable { columns_to_drop: Vec<String> },
     /// Start initial table copy.
     /// `start_lsn` is the `pg_current_wal_lsn` when the initial copy starts.
     StartInitialCopy,
     /// Finish initial table copy and merge buffered changes.
     /// `start_lsn` is the `pg_current_wal_lsn` when the initial copy starts. We want this in FinishInitialCopy so we can set the commit LSN correctly.
-    FinishInitialCopy {
-        start_lsn: u64,
-    },
+    FinishInitialCopy { start_lsn: u64 },
 
     /// ==============================
     /// Table internal events
@@ -206,20 +202,6 @@ pub enum TableEvent {
     EvictedFilesToDelete {
         /// Evicted data files by object storage cache.
         evicted_files: EvictedFiles,
-    },
-
-    /// ================================================
-    /// WAL events
-    /// ================================================
-    ///
-    /// Periodically persist in-memory WAL and truncate WAL files.
-    PeriodicalPersistenceUpdateWal(uuid::Uuid),
-    /// Periodic persist and truncate wal completes.
-    PeriodicalWalPersistenceUpdateResult {
-        result: Result<WalPersistenceUpdateResult>,
-    },
-    FinishRecovery {
-        highest_completion_lsn: u64,
     },
 }
 
@@ -270,36 +252,6 @@ impl TableEvent {
             TableEvent::StreamAbort { .. } => None,
             TableEvent::CommitFlush { lsn, .. } => Some(*lsn),
             _ => None,
-        }
-    }
-
-    pub fn is_recovery(&self) -> bool {
-        match self {
-            TableEvent::Append { is_recovery, .. }
-            | TableEvent::Delete { is_recovery, .. }
-            | TableEvent::Commit { is_recovery, .. }
-            | TableEvent::StreamAbort { is_recovery, .. }
-            | TableEvent::CommitFlush { is_recovery, .. }
-            | TableEvent::StreamFlush { is_recovery, .. } => *is_recovery,
-            _ => unimplemented!(
-                "TableEvent variant not supported for is_recovery: {:?}",
-                self
-            ),
-        }
-    }
-
-    pub fn set_is_recovery(&mut self, is_recovery_to_set: bool) {
-        match self {
-            TableEvent::Append { is_recovery, .. }
-            | TableEvent::Delete { is_recovery, .. }
-            | TableEvent::Commit { is_recovery, .. }
-            | TableEvent::StreamAbort { is_recovery, .. }
-            | TableEvent::CommitFlush { is_recovery, .. }
-            | TableEvent::StreamFlush { is_recovery, .. } => *is_recovery = is_recovery_to_set,
-            _ => unimplemented!(
-                "TableEvent variant not supported for set_recovery: {:?}",
-                self
-            ),
         }
     }
 }

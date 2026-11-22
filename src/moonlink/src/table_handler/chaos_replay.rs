@@ -13,9 +13,11 @@ use crate::storage::mooncake_table::{
     table_creation_test_utils::*, FileIndiceMergeResult, PersistenceSnapshotResult,
 };
 use crate::storage::mooncake_table_config::DiskSliceWriterConfig;
+use crate::storage::snapshot_options::IcebergSnapshotOption;
 use crate::table_handler::chaos_table_metadata::ReplayTableMetadata;
 use crate::table_handler::test_utils::check_read_snapshot;
 use crate::table_notify::{TableEvent, TableMaintenanceStatus};
+use crate::union_read::always_healthy_table_status;
 use crate::IcebergTableConfig;
 use crate::MooncakeTableConfig;
 use crate::ReadStateManager;
@@ -164,7 +166,7 @@ async fn validate_persisted_iceberg_table(
     let cache_temp_dir = tempdir().unwrap();
     let object_storage_cache = create_test_object_storage_cache(&cache_temp_dir);
 
-    let mut table = create_mooncake_table(
+    let mut table = create_mooncake_table_for_validation(
         mooncake_table_metadata.clone(),
         iceberg_table_config.clone(),
         object_storage_cache,
@@ -177,6 +179,7 @@ async fn validate_persisted_iceberg_table(
         &table,
         replication_lsn_rx.clone(),
         last_commit_lsn_rx,
+        always_healthy_table_status(),
         read_state_filepath_remap,
     );
     check_read_snapshot(
@@ -185,6 +188,41 @@ async fn validate_persisted_iceberg_table(
         /*expected_ids=*/ &expected_ids,
     )
     .await;
+}
+
+/// Ids of the iceberg snapshots the source run initiated. The table handler forces an empty
+/// persistence payload from its own state (a flush that persisted no rows while a force snapshot
+/// is pending), which the dump does not record; a recorded initiation shows that the source
+/// snapshot built a payload, so the replay forces one for that snapshot too.
+async fn read_initiated_iceberg_snapshots(replay_filepath: &str) -> HashSet<uuid::Uuid> {
+    let file = tokio::fs::File::open(replay_filepath).await.unwrap();
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    // The first line holds the table metadata.
+    lines.next_line().await.unwrap().unwrap();
+    let mut initiated = HashSet::new();
+    while let Some(serialized_event) = lines.next_line().await.unwrap() {
+        if let MooncakeTableEvent::IcebergSnapshotInitiation(event) =
+            serde_json::from_str(&serialized_event).unwrap()
+        {
+            initiated.insert(event.uuid);
+        }
+    }
+    initiated
+}
+
+/// Waits for the event reader to announce a completed background event. The reader asserts on
+/// every event it handles; if it panics or stops, no further notification can arrive, so fail
+/// with its result instead of waiting forever.
+async fn wait_for_notification(
+    notified: tokio::sync::futures::Notified<'_>,
+    event_reader: &mut tokio::task::JoinHandle<()>,
+) {
+    tokio::select! {
+        _ = notified => {}
+        result = event_reader => {
+            panic!("replay event reader exited while an event was still awaited: {result:?}")
+        }
+    }
 }
 
 pub(crate) async fn replay(replay_filepath: &str) {
@@ -196,6 +234,8 @@ pub(crate) async fn replay(replay_filepath: &str) {
         table_temp_dir,
         iceberg_temp_dir,
     };
+
+    let initiated_iceberg_snapshots = read_initiated_iceberg_snapshots(replay_filepath).await;
 
     // Table event reader.
     let file = tokio::fs::File::open(replay_filepath).await.unwrap();
@@ -259,11 +299,12 @@ pub(crate) async fn replay(replay_filepath: &str) {
         &table,
         replication_lsn_rx,
         commit_lsn_rx,
+        always_healthy_table_status(),
         read_state_filepath_remap,
     );
 
     // Start a background thread which continuously read from event receiver.
-    tokio::spawn(async move {
+    let mut event_reader = tokio::spawn(async move {
         while let Some(table_event) = table_event_receiver.recv().await {
             #[allow(clippy::single_match)]
             match table_event {
@@ -522,6 +563,8 @@ pub(crate) async fn replay(replay_filepath: &str) {
             MooncakeTableEvent::FlushCompletion(flush_completion_event) => {
                 assert!(ongoing_flush_event_id.remove(&flush_completion_event.uuid));
                 loop {
+                    // Register before checking: notify_waiters() only wakes futures that already exist.
+                    let notified = event_notification_clone.notified();
                     let completed_flush_event = {
                         let mut guard = completed_flush_events.lock().await;
                         guard.remove(&flush_completion_event.uuid)
@@ -542,7 +585,7 @@ pub(crate) async fn replay(replay_filepath: &str) {
                         break;
                     }
                     // Otherwise block until the corresponding flush event completes.
-                    event_notification_clone.notified().await;
+                    wait_for_notification(notified, &mut event_reader).await;
                 }
             }
             // =====================
@@ -552,12 +595,21 @@ pub(crate) async fn replay(replay_filepath: &str) {
                 assert!(ongoing_mooncake_snapshot_id.insert(snapshot_initiation_event.uuid));
                 let mut snapshot_option = snapshot_initiation_event.option.clone();
                 snapshot_option.dump_snapshot = true;
+                if let IcebergSnapshotOption::BestEffort(iceberg_snapshot_id) =
+                    &snapshot_option.iceberg_snapshot_option
+                {
+                    if initiated_iceberg_snapshots.contains(iceberg_snapshot_id) {
+                        table.force_empty_persistence_payload();
+                    }
+                }
                 // Event only recorded when snapshot gets created in source run.
                 assert!(table.try_create_mooncake_snapshot(snapshot_option));
             }
             MooncakeTableEvent::MooncakeSnapshotCompletion(snapshot_completion_event) => {
                 assert!(ongoing_mooncake_snapshot_id.remove(&snapshot_completion_event.uuid));
                 loop {
+                    // Register before checking: notify_waiters() only wakes futures that already exist.
+                    let notified = event_notification_clone.notified();
                     let completed_mooncake_snapshot = {
                         let mut guard = completed_mooncake_snapshots.lock().await;
                         guard.remove(&snapshot_completion_event.uuid)
@@ -575,8 +627,8 @@ pub(crate) async fn replay(replay_filepath: &str) {
                         table.notify_snapshot_reader(mooncake_snapshot_result.commit_lsn);
                         break;
                     }
-                    // Otherwise block until the corresponding flush event completes.
-                    event_notification_clone.notified().await;
+                    // Otherwise block until the corresponding mooncake snapshot event completes.
+                    wait_for_notification(notified, &mut event_reader).await;
                 }
 
                 // Validate mooncake snapshot.
@@ -610,6 +662,8 @@ pub(crate) async fn replay(replay_filepath: &str) {
             MooncakeTableEvent::IcebergSnapshotCompletion(snapshot_completion_event) => {
                 assert!(ongoing_iceberg_snapshot_id.remove(&snapshot_completion_event.uuid));
                 loop {
+                    // Register before checking: notify_waiters() only wakes futures that already exist.
+                    let notified = event_notification_clone.notified();
                     let completed_iceberg_snapshot_event = {
                         let mut guard = completed_iceberg_snapshots.lock().await;
                         guard.remove(&snapshot_completion_event.uuid)
@@ -625,8 +679,8 @@ pub(crate) async fn replay(replay_filepath: &str) {
                         table.set_persistence_snapshot_res(persistence_snapshot_result);
                         break;
                     }
-                    // Otherwise block until the corresponding flush event completes.
-                    event_notification_clone.notified().await;
+                    // Otherwise block until the corresponding persistence snapshot event completes.
+                    wait_for_notification(notified, &mut event_reader).await;
                 }
 
                 // Validate iceberg snapshot.
@@ -662,6 +716,8 @@ pub(crate) async fn replay(replay_filepath: &str) {
             MooncakeTableEvent::IndexMergeCompletion(index_merge_completion_event) => {
                 assert!(ongoing_index_merge_id.remove(&index_merge_completion_event.uuid));
                 loop {
+                    // Register before checking: notify_waiters() only wakes futures that already exist.
+                    let notified = event_notification_clone.notified();
                     let completed_index_merge_event = {
                         let mut guard = completed_index_merge.lock().await;
                         guard.remove(&index_merge_completion_event.uuid)
@@ -670,8 +726,8 @@ pub(crate) async fn replay(replay_filepath: &str) {
                         table.set_file_indices_merge_res(completed_index_merge.index_merge_result);
                         break;
                     }
-                    // Otherwise block until the corresponding flush event completes.
-                    event_notification_clone.notified().await;
+                    // Otherwise block until the corresponding index merge event completes.
+                    wait_for_notification(notified, &mut event_reader).await;
                 }
             }
             // =====================
@@ -691,6 +747,8 @@ pub(crate) async fn replay(replay_filepath: &str) {
             MooncakeTableEvent::DataCompactionCompletion(data_compaction_completion_event) => {
                 assert!(ongoing_data_compaction_id.remove(&data_compaction_completion_event.uuid));
                 loop {
+                    // Register before checking: notify_waiters() only wakes futures that already exist.
+                    let notified = event_notification_clone.notified();
                     let completed_data_compaction_event = {
                         let mut guard = completed_data_compaction.lock().await;
                         guard.remove(&data_compaction_completion_event.uuid)
@@ -706,10 +764,63 @@ pub(crate) async fn replay(replay_filepath: &str) {
                         table.set_data_compaction_res(data_compaction_result);
                         break;
                     }
-                    // Otherwise block until the corresponding flush event completes.
-                    event_notification_clone.notified().await;
+                    // Otherwise block until the corresponding data compaction event completes.
+                    wait_for_notification(notified, &mut event_reader).await;
                 }
             }
         }
     }
+}
+
+/// The source run persisted an empty iceberg snapshot for its second mooncake snapshot (as after a
+/// flush that wrote no rows while a force snapshot was pending); nothing changed since the first
+/// one, so the replay builds that payload only if it forces it as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replays_an_iceberg_snapshot_of_a_forced_empty_payload() {
+    let table_dir = tempdir().unwrap();
+    let metadata = ReplayTableMetadata {
+        config: MooncakeTableConfig::new(table_dir.path().to_str().unwrap().to_string()),
+        local_filesystem_optimization_enabled: false,
+        storage_config: StorageConfig::FileSystem {
+            root_directory: table_dir.path().to_str().unwrap().to_string(),
+            atomic_write_dir: None,
+        },
+        is_upsert_table: false,
+    };
+    let flush = uuid::Uuid::new_v4();
+    let [first_snapshot, first_iceberg, second_snapshot, second_iceberg] =
+        std::array::from_fn(|_| uuid::Uuid::new_v4());
+    let snapshot_initiation = |id: uuid::Uuid, iceberg_id: uuid::Uuid, force_create: bool| {
+        format!(
+            r#"{{"MooncakeSnapshotInitiation":{{"uuid":"{id}","option":{{"uuid":"{id}","dump_snapshot":false,"force_create":{force_create},"iceberg_snapshot_option":{{"BestEffort":"{iceberg_id}"}},"index_merge_option":"Skip","data_compaction_option":"Skip"}}}}}}"#
+        )
+    };
+    let iceberg_snapshot = |id: uuid::Uuid| {
+        [
+            format!(
+                r#"{{"IcebergSnapshotInitiation":{{"uuid":"{id}","flush_lsn":1,"committed_deletion_logs":[],"import_payload":{{"data_files":[],"new_deletion_vector":{{}},"file_indices":[]}},"index_merge_payload":{{"new_file_indices":[],"old_file_indices":[]}},"data_compaction_payload":{{"new_data_files_to_import":[],"old_data_files_to_remove":[],"new_file_indices_to_import":[],"old_file_indices_to_remove":[]}}}}}}"#
+            ),
+            format!(r#"{{"IcebergSnapshotCompletion":{{"uuid":"{id}","lsn":1}}}}"#),
+        ]
+    };
+    let mut dump = vec![
+        serde_json::to_string(&metadata).unwrap(),
+        r#"{"Append":{"row":{"values":[{"Int32":0},{"ByteArray":[117,115,101,114]},{"Int32":0}]},"xact_id":null}}"#.to_string(),
+        r#"{"Commit":{"xact_id":null,"lsn":1}}"#.to_string(),
+        format!(r#"{{"FlushInitiation":{{"uuid":"{flush}","xact_id":null,"lsn":1,"commit_check_point":{{"MemoryBatch":[0,1]}}}}}}"#),
+        format!(r#"{{"FlushCompletion":{{"uuid":"{flush}","file_ids":[]}}}}"#),
+        snapshot_initiation(first_snapshot, first_iceberg, false),
+        format!(r#"{{"MooncakeSnapshotCompletion":{{"uuid":"{first_snapshot}","lsn":1}}}}"#),
+    ];
+    dump.extend(iceberg_snapshot(first_iceberg));
+    dump.push(snapshot_initiation(second_snapshot, second_iceberg, true));
+    dump.push(format!(
+        r#"{{"MooncakeSnapshotCompletion":{{"uuid":"{second_snapshot}","lsn":1}}}}"#
+    ));
+    dump.extend(iceberg_snapshot(second_iceberg));
+    let dump_dir = tempdir().unwrap();
+    let dump_filepath = dump_dir.path().join("events");
+    std::fs::write(&dump_filepath, dump.join("\n") + "\n").unwrap();
+
+    replay(dump_filepath.to_str().unwrap()).await;
 }

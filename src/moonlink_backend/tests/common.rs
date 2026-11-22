@@ -74,6 +74,7 @@ impl TestGuard {
             .to_string();
         let table_config = TableConfig {
             mooncake_config: MooncakeConfig {
+                mem_slice_bytes: None,
                 skip_index_merge: true,
                 skip_data_compaction: true,
                 append_only: Some(false),
@@ -82,12 +83,6 @@ impl TestGuard {
             iceberg_config: Some(AccessorConfig::new_with_storage_config(
                 StorageConfig::FileSystem {
                     root_directory: root_directory.clone(),
-                    atomic_write_dir: None,
-                },
-            )),
-            wal_config: Some(AccessorConfig::new_with_storage_config(
-                StorageConfig::FileSystem {
-                    root_directory,
                     atomic_write_dir: None,
                 },
             )),
@@ -135,6 +130,20 @@ impl Drop for TestGuard {
             });
         });
     }
+}
+
+/// Return the `confirmed_flush_lsn` of moonlink's replication slot.
+#[allow(dead_code)]
+pub async fn confirmed_flush_lsn(client: &Client) -> u64 {
+    let row = client
+        .query_one(
+            "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name LIKE 'moonlink_slot%'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let lsn: PgLsn = row.get(0);
+    lsn.into()
 }
 
 /// Return the current WAL LSN as a simple `u64`.
@@ -336,6 +345,25 @@ pub async fn crash_and_recover_backend(
 /// Extract primary-key IDs from `read_state` **after applying deletion vectors and position deletes**.
 #[allow(dead_code)]
 pub async fn ids_from_state_with_deletes(read_state: &ReadState) -> HashSet<i64> {
+    id_counts_from_state_with_deletes(read_state)
+        .await
+        .into_keys()
+        .collect()
+}
+
+/// Count the rows per primary-key ID in `read_state` after applying its deletions.
+#[allow(dead_code)]
+pub async fn id_counts_from_state_with_deletes(read_state: &ReadState) -> HashMap<i64, u64> {
+    let (data_files, position_deletes) = data_files_and_deleted_rows(read_state).await;
+    apply_position_deletes_to_files(&data_files, &position_deletes)
+}
+
+/// The data files of `read_state` and every deleted row in them: its position deletes plus the
+/// rows of its deletion vectors (puffin blobs).
+#[allow(dead_code)]
+pub async fn data_files_and_deleted_rows(
+    read_state: &ReadState,
+) -> (Vec<String>, Vec<PositionDelete>) {
     use iceberg::io::FileIOBuilder;
     use iceberg::puffin::PuffinReader;
 
@@ -368,9 +396,7 @@ pub async fn ids_from_state_with_deletes(read_state: &ReadState) -> HashSet<i64>
             }));
         }
     }
-
-    // Apply position deletes to get final set of IDs
-    apply_position_deletes_to_files(&data_files, &position_deletes)
+    (data_files, position_deletes)
 }
 
 /// Parse deletion vector blob data to extract deleted row indices.
@@ -397,7 +423,7 @@ fn parse_deletion_vector_blob(blob_data: &[u8]) -> Vec<u64> {
 fn apply_position_deletes_to_files(
     data_files: &[String],
     position_deletes: &[PositionDelete],
-) -> HashSet<i64> {
+) -> HashMap<i64, u64> {
     // Group deletes by file index
     let mut deletes_by_file: std::collections::HashMap<u32, HashSet<u32>> =
         std::collections::HashMap::new();
@@ -422,7 +448,7 @@ fn apply_position_deletes_to_files(
             .insert(*row_index);
     }
 
-    let mut result = HashSet::new();
+    let mut result = HashMap::new();
     for (file_index, file_path) in data_files.iter().enumerate() {
         let ids = read_ids_from_parquet(file_path);
         let deletes = deletes_by_file.get(&(file_index as u32));
@@ -431,7 +457,7 @@ fn apply_position_deletes_to_files(
             if let Some(id) = id_opt {
                 // Only include the ID if it's not in the delete set for this file
                 if deletes.is_none_or(|d| !d.contains(&(row_index as u32))) {
-                    result.insert(id);
+                    *result.entry(id).or_insert(0) += 1;
                 }
             }
         }
@@ -444,6 +470,7 @@ pub fn get_serialized_table_config(tmp_dir: &TempDir) -> String {
     let root_directory = tmp_dir.path().to_str().unwrap().to_string();
     let table_config = TableConfig {
         mooncake_config: MooncakeConfig {
+            mem_slice_bytes: None,
             skip_index_merge: true,
             skip_data_compaction: true,
             append_only: Some(false),
@@ -452,12 +479,6 @@ pub fn get_serialized_table_config(tmp_dir: &TempDir) -> String {
         iceberg_config: Some(AccessorConfig::new_with_storage_config(
             StorageConfig::FileSystem {
                 root_directory: root_directory.clone(),
-                atomic_write_dir: None,
-            },
-        )),
-        wal_config: Some(AccessorConfig::new_with_storage_config(
-            StorageConfig::FileSystem {
-                root_directory,
                 atomic_write_dir: None,
             },
         )),
@@ -622,6 +643,49 @@ pub async fn connect_to_postgres(uri: &str) -> (Client, tokio::task::JoinHandle<
         let _ = connection.await;
     });
     (client, connection_handle)
+}
+
+/// Sets `logical_decoding_work_mem` on the test Postgres while alive and resets it when dropped,
+/// also when the test fails, so that later tests do not run with it.
+#[allow(dead_code)]
+pub struct LogicalDecodingWorkMem;
+
+#[allow(dead_code)]
+impl LogicalDecodingWorkMem {
+    pub async fn set(value: &str) -> Self {
+        let (client, _connection) = connect_to_postgres(&get_database_uri()).await;
+        client
+            .simple_query(&format!(
+                "ALTER SYSTEM SET logical_decoding_work_mem = '{value}'"
+            ))
+            .await
+            .unwrap();
+        client
+            .simple_query("SELECT pg_reload_conf()")
+            .await
+            .unwrap();
+        Self
+    }
+}
+
+impl Drop for LogicalDecodingWorkMem {
+    fn drop(&mut self) {
+        // Drop cannot wait on the test's runtime; reset from a thread with a runtime of its own.
+        let _ = std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (client, _connection) = connect_to_postgres(&get_database_uri()).await;
+                let _ = client
+                    .simple_query("ALTER SYSTEM RESET logical_decoding_work_mem")
+                    .await;
+                let _ = client.simple_query("SELECT pg_reload_conf()").await;
+            });
+        })
+        .join();
+    }
 }
 
 /// Util function to get database URI.

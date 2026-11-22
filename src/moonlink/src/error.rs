@@ -1,9 +1,7 @@
 use arrow::error::ArrowError;
-use deltalake::DeltaTableError;
 use iceberg::Error as IcebergError;
 use moonlink_error::io_error_utils::get_io_error_status;
 use moonlink_error::{ErrorStatus, ErrorStruct};
-use opentelemetry_otlp::ExporterBuildError as OtelExporterBuildError;
 use parquet::errors::ParquetError;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -30,9 +28,6 @@ pub enum Error {
     IcebergError(ErrorStruct),
 
     #[error("{0}")]
-    DeltaLakeError(ErrorStruct),
-
-    #[error("{0}")]
     OpenDal(ErrorStruct),
 
     #[error("{0}")]
@@ -45,29 +40,55 @@ pub enum Error {
     PbToMoonlinkRowError(ErrorStruct),
 
     #[error("{0}")]
-    OtelExporterBuildError(ErrorStruct),
+    TableErrored(ErrorStruct),
+
+    /// The table handler is gone (table dropped, or its event loop stopped); unlike
+    /// [`Error::TableErrored`] this does not say anything about the table's data.
+    #[error("{0}")]
+    TableHandlerStopped(ErrorStruct),
+
+    /// An iceberg commit failed in a way that may or may not have changed the committed table;
+    /// retrying could duplicate or lose data.
+    #[error("{0}")]
+    IcebergCommitOutcomeUnknown(ErrorStruct),
 }
 
 pub type Result<T> = result::Result<T, Error>;
 
 impl Error {
     #[track_caller]
+    pub fn iceberg_commit_outcome_unknown(message: String) -> Self {
+        Self::IcebergCommitOutcomeUnknown(ErrorStruct::new(message, ErrorStatus::Permanent))
+    }
+
+    /// User-facing message for an errored mirror table.
+    pub fn errored_table_message(table_name: &str, reason: &str) -> String {
+        format!(
+            "mirror {table_name} is out of sync: {reason}; drop and re-create it with mooncake.create_table"
+        )
+    }
+
+    /// Error returned for any request on a table in the errored state; `message` comes from
+    /// [`Error::errored_table_message`].
+    #[track_caller]
+    pub fn table_errored(message: &str) -> Self {
+        Self::TableErrored(ErrorStruct::new(
+            message.to_string(),
+            ErrorStatus::Permanent,
+        ))
+    }
+
+    #[track_caller]
+    pub fn table_handler_stopped(message: &str) -> Self {
+        Self::TableHandlerStopped(ErrorStruct::new(
+            message.to_string(),
+            ErrorStatus::Permanent,
+        ))
+    }
+
+    #[track_caller]
     pub fn pb_conversion_error(message: String) -> Self {
         Self::PbToMoonlinkRowError(ErrorStruct::new(message, ErrorStatus::Permanent))
-    }
-    #[track_caller]
-    pub fn delta_generic_error(message: String) -> Self {
-        Self::DeltaLakeError(ErrorStruct::new(message, ErrorStatus::Permanent))
-    }
-}
-
-impl From<OtelExporterBuildError> for Error {
-    #[track_caller]
-    fn from(source: OtelExporterBuildError) -> Self {
-        Error::OtelExporterBuildError(
-            ErrorStruct::new("exporter build error".to_string(), ErrorStatus::Permanent)
-                .with_source(source),
-        )
     }
 }
 
@@ -113,15 +134,6 @@ impl From<IcebergError> for Error {
         Error::IcebergError(
             ErrorStruct::new("Iceberg error".to_string(), status).with_source(source),
         )
-    }
-}
-
-impl From<DeltaTableError> for Error {
-    #[track_caller]
-    fn from(source: DeltaTableError) -> Self {
-        let status = ErrorStatus::Permanent;
-
-        Error::Json(ErrorStruct::new("Delta table error".to_string(), status).with_source(source))
     }
 }
 
@@ -203,27 +215,62 @@ impl From<std::string::FromUtf8Error> for Error {
     }
 }
 
+impl From<url::ParseError> for Error {
+    #[track_caller]
+    fn from(source: url::ParseError) -> Self {
+        let status = ErrorStatus::Permanent;
+
+        Error::Json(ErrorStruct::new("URL parse error".to_string(), status).with_source(source))
+    }
+}
+
 impl Error {
     pub fn get_status(&self) -> ErrorStatus {
+        self.error_struct().status
+    }
+
+    fn error_struct(&self) -> &ErrorStruct {
         match self {
             Error::Arrow(err)
             | Error::Io(err)
             | Error::Parquet(err)
             | Error::WatchChannelRecvError(err)
             | Error::IcebergError(err)
-            | Error::DeltaLakeError(err)
             | Error::OpenDal(err)
             | Error::JoinError(err)
             | Error::PbToMoonlinkRowError(err)
-            | Error::OtelExporterBuildError(err)
-            | Error::Json(err) => err.status,
+            | Error::Json(err)
+            | Error::TableErrored(err)
+            | Error::TableHandlerStopped(err)
+            | Error::IcebergCommitOutcomeUnknown(err) => err,
         }
+    }
+
+    /// Whether the error was caused by a full disk (ENOSPC), which goes away once space is freed.
+    pub fn is_storage_full(&self) -> bool {
+        let mut source = self.error_struct().source();
+        while let Some(err) = source {
+            if let Some(io_err) = err.downcast_ref::<io::Error>() {
+                if io_err.kind() == io::ErrorKind::StorageFull || io_err.raw_os_error() == Some(28)
+                {
+                    return true;
+                }
+            }
+            source = match err.downcast_ref::<Error>() {
+                Some(inner) => inner.error_struct().source(),
+                None => err.source(),
+            };
+        }
+        false
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Line of the `?` in [`create_source_error`], where the error location must point.
+    const SOURCE_ERROR_LINE: u32 = line!() + 4;
 
     /// Test util functions to create error.
     fn create_source_error() -> Result<()> {
@@ -245,9 +292,10 @@ mod tests {
         let io_error = another_propagate_error().unwrap_err();
         if let Error::Io(ref inner) = io_error {
             let loc = inner.location.as_ref().unwrap();
-            assert!(loc.contains("src/moonlink/src/error.rs"));
-            assert!(loc.contains("230"));
-            assert!(loc.contains("9"));
+            assert!(
+                loc.contains(&format!("src/moonlink/src/error.rs:{SOURCE_ERROR_LINE}:9")),
+                "unexpected location {loc}"
+            );
         }
     }
 }

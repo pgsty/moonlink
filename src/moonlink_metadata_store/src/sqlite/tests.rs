@@ -2,17 +2,12 @@ use crate::base_metadata_store::MetadataStoreTrait;
 use crate::sqlite::sqlite_metadata_store::SqliteMetadataStore;
 use moonlink::{
     AccessorConfig, IcebergCatalogConfig, IcebergTableConfig, MoonlinkTableConfig, StorageConfig,
-    WalConfig,
 };
 
 use tempfile::{tempdir, TempDir};
 
 /// Source table uri.
-#[cfg(not(feature = "test-tls"))]
 const SRC_TABLE_URI: &str = "postgresql://postgres:postgres@postgres:5432/postgres?sslmode=disable";
-#[cfg(feature = "test-tls")]
-const SRC_TABLE_URI: &str =
-    "postgresql://postgres:postgres@postgres:5432/postgres?sslmode=verify-full";
 
 /// Test table name.
 const SRC_TABLE_NAME: &str = "src_table";
@@ -23,21 +18,6 @@ const TABLE: &str = "dst_schema.dst_table";
 
 /// Create a filesystem config for test.
 fn get_storage_config() -> StorageConfig {
-    #[allow(unreachable_code)]
-    #[cfg(feature = "storage-gcs")]
-    {
-        return StorageConfig::Gcs {
-            project: "project".to_string(),
-            region: "region".to_string(),
-            bucket: "bucket".to_string(),
-            access_key_id: "access_key_id".to_string(),
-            secret_access_key: "secret_access_key".to_string(),
-            endpoint: None,
-            disable_auth: false,
-            write_option: None,
-        };
-    }
-
     #[allow(unreachable_code)]
     #[cfg(feature = "storage-s3")]
     {
@@ -71,10 +51,6 @@ fn get_accessor_config() -> AccessorConfig {
 
 /// Create a moonlink table config for test.
 pub(crate) fn get_moonlink_table_config() -> MoonlinkTableConfig {
-    let wal_accessor = AccessorConfig::new_with_storage_config(StorageConfig::FileSystem {
-        root_directory: "/tmp/test_wal_uri".to_string(),
-        atomic_write_dir: None,
-    });
     MoonlinkTableConfig {
         iceberg_table_config: IcebergTableConfig {
             namespace: vec!["namespace".to_string()],
@@ -84,12 +60,11 @@ pub(crate) fn get_moonlink_table_config() -> MoonlinkTableConfig {
                 accessor_config: get_accessor_config(),
             },
         },
-        wal_table_config: WalConfig::new(wal_accessor, &format!("{DATABASE}.{TABLE}")),
         ..Default::default()
     }
 }
 
-// S3/GCS builders moved to crate test_utils and re-used here.
+// S3 builders live in crate test_utils and are re-used here.
 
 async fn check_persisted_metadata(sqlite_metadata_store: &SqliteMetadataStore) {
     let metadata_entries = sqlite_metadata_store
@@ -177,36 +152,7 @@ async fn test_table_metadata_store_and_load_s3() {
     let sqlite_path = get_sqlite_database_filepath(&tmp_dir);
 
     let metadata_store = SqliteMetadataStore::new(sqlite_path.clone()).await.unwrap();
-    let moonlink_table_config = get_s3_moonlink_table_config(DATABASE, TABLE);
-
-    metadata_store
-        .store_table_metadata(
-            DATABASE,
-            TABLE,
-            SRC_TABLE_NAME,
-            SRC_TABLE_URI,
-            moonlink_table_config.clone(),
-        )
-        .await
-        .unwrap();
-
-    let entries = metadata_store
-        .get_all_table_metadata_entries()
-        .await
-        .unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].moonlink_table_config, moonlink_table_config);
-}
-
-#[cfg(feature = "storage-gcs")]
-#[tokio::test]
-async fn test_table_metadata_store_and_load_gcs() {
-    use crate::test_utils::get_gcs_moonlink_table_config;
-    let tmp_dir = tempdir().unwrap();
-    let sqlite_path = get_sqlite_database_filepath(&tmp_dir);
-
-    let metadata_store = SqliteMetadataStore::new(sqlite_path.clone()).await.unwrap();
-    let moonlink_table_config = get_gcs_moonlink_table_config(DATABASE, TABLE);
+    let moonlink_table_config = get_s3_moonlink_table_config();
 
     metadata_store
         .store_table_metadata(

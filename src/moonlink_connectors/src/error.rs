@@ -1,8 +1,6 @@
 use crate::pg_replicate::postgres_source::{
     CdcStreamError, PostgresSourceError, TableCopyStreamError,
 };
-use crate::rest_ingest::rest_source::RestSourceError;
-use crate::rest_ingest::{json_converter, schema_util, SrcTableId};
 use moonlink::Error as MoonlinkError;
 use moonlink_error::{io_error_utils, ErrorStatus, ErrorStruct};
 use serde::{Deserialize, Serialize};
@@ -43,26 +41,6 @@ pub enum Error {
     #[error("{0}")]
     ReplDuplicateTable(ErrorStruct),
 
-    // REST API error.
-    #[error("{0}")]
-    RestApi(ErrorStruct),
-
-    // REST source error.
-    #[error("{0}")]
-    RestSource(ErrorStruct),
-
-    // REST source error: duplicate source table to add.
-    #[error("{0}")]
-    RestDuplicateTable(ErrorStruct),
-
-    // REST source error: non-existent source table to remove.
-    #[error("{0}")]
-    RestNonExistentTable(ErrorStruct),
-
-    // REST source error: conversion from payload to moonlink row fails.
-    #[error("{0}")]
-    RestPayloadConversion(ErrorStruct),
-
     // Parquet parse error.
     #[error("{0}")]
     ParquetError(ErrorStruct),
@@ -70,21 +48,56 @@ pub enum Error {
     // Background writer task failed (panic/cancel/join error).
     #[error("{0}")]
     WriterTaskFailed(ErrorStruct),
-
-    // Schema building error
+    // The mirror is in the errored state; the message tells the user what to do.
     #[error("{0}")]
-    SchemaBuildError(ErrorStruct),
+    TableErrored(ErrorStruct),
+    // The source table cannot be mirrored faithfully.
+    #[error("{0}")]
+    UnsupportedSourceTable(ErrorStruct),
 }
 
 pub type Result<T> = result::Result<T, Error>;
 
 impl Error {
+    pub fn error_struct(&self) -> &ErrorStruct {
+        match self {
+            Error::PostgresSourceError(es)
+            | Error::TokioPostgres(es)
+            | Error::CdcStream(es)
+            | Error::TableCopyStream(es)
+            | Error::MoonlinkError(es)
+            | Error::Io(es)
+            | Error::MpscChannelSendError(es)
+            | Error::TableNotFound(es)
+            | Error::ReplDuplicateTable(es)
+            | Error::ParquetError(es)
+            | Error::WriterTaskFailed(es)
+            | Error::TableErrored(es)
+            | Error::UnsupportedSourceTable(es) => es,
+        }
+    }
+
+    /// Whether the failure is about reaching the source (refused or lost connections, the server
+    /// starting or shutting down, too many connections, authentication, lock timeouts), so trying
+    /// again later can succeed, rather than about the table itself.
+    pub fn is_transient_source_error(&self) -> bool {
+        error_struct_has_cause(self.error_struct(), &is_transient_cause)
+    }
+
+    /// A new connection to a source must wait for an earlier one to finish shutting down.
     #[track_caller]
-    pub fn rest_duplicate_table(id: SrcTableId) -> Self {
-        Error::RestDuplicateTable(ErrorStruct {
-            message: format!("REST source error: duplicate source table to add with table id {id}"),
-            status: ErrorStatus::Permanent,
-            source: None,
+    pub fn source_shutting_down(source: &str) -> Self {
+        Error::Io(ErrorStruct {
+            message: format!(
+                "an earlier connection to {source} is still shutting down (dropping its \
+                 publication, replication slot or a dropped mirror's publication entry); retry"
+            ),
+            status: ErrorStatus::Temporary,
+            // A timeout, so recovery (`is_transient_cause`) also treats it as transient.
+            source: Some(Arc::new(
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "waiting for the shutdown")
+                    .into(),
+            )),
             location: Some(Location::caller().to_string()),
         })
     }
@@ -99,10 +112,11 @@ impl Error {
         })
     }
 
+    /// Request on a mirror that is in the errored state.
     #[track_caller]
-    pub fn repl_duplicate_table(table_name: String) -> Self {
-        Error::ReplDuplicateTable(ErrorStruct {
-            message: format!("Duplicate table added to replication: {table_name}"),
+    pub fn table_errored(message: &str) -> Self {
+        Error::TableErrored(ErrorStruct {
+            message: message.to_string(),
             status: ErrorStatus::Permanent,
             source: None,
             location: Some(Location::caller().to_string()),
@@ -110,21 +124,45 @@ impl Error {
     }
 
     #[track_caller]
-    pub fn rest_api(err_msg: String, err: Option<Arc<anyhow::Error>>) -> Self {
-        Error::RestApi(ErrorStruct {
-            message: format!("REST API error: {err_msg}"),
+    pub fn unsupported_source_table(src_table_name: &str, reason: &str) -> Self {
+        Error::UnsupportedSourceTable(ErrorStruct {
+            message: format!("source table {src_table_name} cannot be mirrored: {reason}"),
             status: ErrorStatus::Permanent,
-            source: err,
+            source: None,
+            location: Some(Location::caller().to_string()),
+        })
+    }
+
+    /// A source table changed in a way its existing mirror cannot follow.
+    #[track_caller]
+    pub fn source_table_changed(src_table_name: &str, reason: &str) -> Self {
+        Error::UnsupportedSourceTable(ErrorStruct {
+            message: format!(
+                "source table {src_table_name} changed in a way its mirror cannot follow: {reason}"
+            ),
+            status: ErrorStatus::Permanent,
+            source: None,
+            location: Some(Location::caller().to_string()),
+        })
+    }
+
+    /// A second mirror of a source table that is already mirrored.
+    #[track_caller]
+    pub fn source_already_mirrored(src_table_name: &str) -> Self {
+        Error::ReplDuplicateTable(ErrorStruct {
+            message: format!(
+                "source table {src_table_name} is already mirrored; a source table can have only one mirror"
+            ),
+            status: ErrorStatus::Permanent,
+            source: None,
             location: Some(Location::caller().to_string()),
         })
     }
 
     #[track_caller]
-    pub fn rest_non_existent_table(id: SrcTableId) -> Self {
-        Error::RestNonExistentTable(ErrorStruct {
-            message: format!(
-                "REST source error: non-existent source table to remove with table id {id}"
-            ),
+    pub fn repl_duplicate_table(table_name: String) -> Self {
+        Error::ReplDuplicateTable(ErrorStruct {
+            message: format!("Duplicate table added to replication: {table_name}"),
             status: ErrorStatus::Permanent,
             source: None,
             location: Some(Location::caller().to_string()),
@@ -228,30 +266,6 @@ impl<T: Send + Sync + 'static> From<tokio::sync::mpsc::error::SendError<T>> for 
     }
 }
 
-impl From<RestSourceError> for Error {
-    #[track_caller]
-    fn from(source: RestSourceError) -> Self {
-        Error::RestSource(ErrorStruct {
-            message: "rest source error".to_string(),
-            status: ErrorStatus::Permanent,
-            source: Some(Arc::new(source.into())),
-            location: Some(Location::caller().to_string()),
-        })
-    }
-}
-
-impl From<json_converter::JsonToMoonlinkRowError> for Error {
-    #[track_caller]
-    fn from(source: json_converter::JsonToMoonlinkRowError) -> Self {
-        Error::RestPayloadConversion(ErrorStruct {
-            message: "REST API payload conversion error".to_string(),
-            status: ErrorStatus::Permanent,
-            source: Some(Arc::new(source.into())),
-            location: Some(Location::caller().to_string()),
-        })
-    }
-}
-
 impl From<parquet::errors::ParquetError> for Error {
     #[track_caller]
     fn from(source: parquet::errors::ParquetError) -> Self {
@@ -264,14 +278,55 @@ impl From<parquet::errors::ParquetError> for Error {
     }
 }
 
-impl From<schema_util::SchemaBuildError> for Error {
-    #[track_caller]
-    fn from(source: schema_util::SchemaBuildError) -> Self {
-        Error::SchemaBuildError(ErrorStruct {
-            message: "Schema building error".to_string(),
-            status: ErrorStatus::Permanent,
-            source: Some(Arc::new(source.into())),
-            location: Some(Location::caller().to_string()),
-        })
+/// Whether `es` or anything it wraps (through nested connector errors too) satisfies `pred`.
+pub fn error_struct_has_cause(
+    es: &ErrorStruct,
+    pred: &dyn Fn(&(dyn std::error::Error + 'static)) -> bool,
+) -> bool {
+    let Some(source) = &es.source else {
+        return false;
+    };
+    source.chain().any(|cause| {
+        pred(cause)
+            || cause
+                .downcast_ref::<Error>()
+                .is_some_and(|inner| error_struct_has_cause(inner.error_struct(), pred))
+    })
+}
+
+pub fn is_transient_cause(cause: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(e) = cause.downcast_ref::<TokioPostgresError>() {
+        return match e.code() {
+            // Not a server error: connecting, a closed connection, I/O, a timeout.
+            None => true,
+            Some(code) => {
+                let code = code.code();
+                // connection exception, insufficient resources, invalid authorization
+                code.starts_with("08")
+                    || code.starts_with("53")
+                    || code.starts_with("28")
+                    // admin/crash shutdown, cannot connect now (starting up)
+                    || code.starts_with("57P0")
+                    // lock_not_available (lock_timeout), serialization failure, deadlock
+                    || code == "55P03"
+                    || code == "40001"
+                    || code == "40P01"
+            }
+        };
     }
+    if let Some(e) = cause.downcast_ref::<std::io::Error>() {
+        use std::io::ErrorKind::*;
+        return matches!(
+            e.kind(),
+            ConnectionRefused
+                | ConnectionReset
+                | ConnectionAborted
+                | NotConnected
+                | TimedOut
+                | BrokenPipe
+                | AddrNotAvailable
+                | UnexpectedEof
+        );
+    }
+    false
 }

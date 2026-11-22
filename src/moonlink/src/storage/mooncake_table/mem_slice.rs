@@ -73,28 +73,30 @@ impl MemSlice {
         }
     }
 
-    /// Find the first non-deleted position for a given lookup key
-    pub async fn find_non_deleted_position(
+    #[must_use]
+    pub(crate) fn try_delete_at_pos(
+        &mut self,
+        pos: (u64, usize),
+    ) -> super::data_batches::DeleteAtPosOutcome {
+        self.column_store.try_delete_at_pos(pos)
+    }
+
+    /// First non-deleted position for the record that is not in `exclude` (positions already
+    /// claimed by pending deletes of the same transaction).
+    pub(crate) fn find_non_deleted_position_excluding(
         &self,
         record: &RawDeletionRecord,
         identity: &IdentityProp,
+        exclude: &std::collections::HashSet<(u64, usize)>,
     ) -> Option<(u64, usize)> {
-        let locations = self.mem_index.find_record(record);
-
-        for location in locations {
-            let ret = self
-                .column_store
-                .find_valid_row_by_record(record, &location, identity);
-            if ret.is_some() {
-                return ret;
-            }
-        }
-        None
-    }
-
-    #[must_use]
-    pub fn try_delete_at_pos(&mut self, pos: (u64, usize)) -> bool {
-        self.column_store.try_delete_at_pos(pos)
+        self.mem_index
+            .find_record(record)
+            .into_iter()
+            .filter_map(|location| {
+                self.column_store
+                    .find_valid_row_by_record(record, &location, identity)
+            })
+            .find(|pos| !exclude.contains(pos))
     }
 
     /// Append the given row into column store buffer and mem index.
@@ -118,6 +120,15 @@ impl MemSlice {
 
     pub(super) fn get_num_rows(&self) -> usize {
         self.column_store.get_num_rows()
+    }
+
+    pub(super) fn get_approx_bytes(&self) -> usize {
+        self.column_store.get_approx_bytes()
+    }
+
+    /// Whether the slice reached either the row or the byte flush threshold.
+    pub(super) fn reached_flush_threshold(&self, max_rows: usize, max_bytes: usize) -> bool {
+        self.get_num_rows() >= max_rows || self.get_approx_bytes() >= max_bytes
     }
 
     #[allow(clippy::type_complexity)]
@@ -214,6 +225,7 @@ mod tests {
                         lsn: 0,
                         pos: None,
                         row_identity: None,
+                        identity_fingerprint: None,
                         delete_if_exists: false,
                     },
                     &IdentityProp::SinglePrimitiveKey(0)
@@ -229,6 +241,7 @@ mod tests {
                         lsn: 0,
                         pos: None,
                         row_identity: None,
+                        identity_fingerprint: None,
                         delete_if_exists: false,
                     },
                     &IdentityProp::SinglePrimitiveKey(0)
@@ -244,6 +257,7 @@ mod tests {
                         lsn: 0,
                         pos: None,
                         row_identity: None,
+                        identity_fingerprint: None,
                         delete_if_exists: false,
                     },
                     &IdentityProp::SinglePrimitiveKey(0)

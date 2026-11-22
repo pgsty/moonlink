@@ -8,6 +8,7 @@ use pg_escape::{quote_identifier, quote_literal};
 use postgres_native_tls::{MakeTlsConnector, TlsStream};
 use postgres_replication::LogicalReplicationStream;
 use thiserror::Error;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::tls::MakeTlsConnect;
 use tokio_postgres::{
     config::ReplicationMode,
@@ -26,6 +27,10 @@ pub struct SlotInfo {
 pub struct ReplicationClient {
     postgres_client: PostgresClient,
     in_txn: bool,
+    /// Replication session that exported the current snapshot from a temporary slot. Kept open
+    /// until the transaction ends: the snapshot stays importable only while it is idle, and closing
+    /// it drops the temporary slot.
+    snapshot_exporter: Option<(PostgresClient, tokio::task::JoinHandle<()>)>,
 }
 
 #[derive(Debug, Error)]
@@ -51,7 +56,8 @@ pub enum ReplicationClientError {
     #[error("type modifier column is not a valid u32")]
     TypeModifierColumnNotI32,
 
-    #[error("column {0}'s type with oid {1} in relation {2} is not supported")]
+    /// `{0}` is the column name with its type, e.g. `d (interval)`.
+    #[error("column {0} of {2} has a type mirrors cannot store (type oid {1})")]
     UnsupportedType(String, u32, String),
 
     #[error("table {0} doesn't exist")]
@@ -67,6 +73,12 @@ pub enum ReplicationClientError {
     FailedToCreateSlot,
 }
 
+/// Session settings for every copy and replication connection: one canonical, exact text form
+/// for dates and timestamps, floats (shortest exact output), intervals and bytea (hex), whatever
+/// the database or role defaults to. Postgres' own logical-replication worker pins the same.
+const CANONICAL_TEXT_OPTIONS: &str = "-c TimeZone=UTC -c DateStyle=ISO -c IntervalStyle=postgres \
+     -c extra_float_digits=3 -c bytea_output=hex";
+
 impl ReplicationClient {
     /// Connect to a postgres database in logical replication mode without TLS
     pub async fn connect(
@@ -81,6 +93,16 @@ impl ReplicationClient {
         if replication_mode {
             config.replication_mode(ReplicationMode::Logical);
         }
+        // Values are parsed from Postgres' text output (COPY and pgoutput), which follows session
+        // settings: a local zone prints old timestamptz values with LMT offsets, and
+        // extra_float_digits <= 0 rounds every float.
+        let options = match config.get_options() {
+            Some(existing) if !existing.is_empty() => {
+                format!("{existing} {CANONICAL_TEXT_OPTIONS}")
+            }
+            _ => CANONICAL_TEXT_OPTIONS.to_string(),
+        };
+        config.options(&options);
         let (postgres_client, connection) = config.connect(tls).await?;
 
         debug!("successfully connected to postgres");
@@ -89,8 +111,31 @@ impl ReplicationClient {
             ReplicationClient {
                 postgres_client,
                 in_txn: false,
+                snapshot_exporter: None,
             },
             connection,
+        ))
+    }
+
+    /// Run IDENTIFY_SYSTEM; only valid on a connection opened in replication mode.
+    /// Returns (system identifier, database name).
+    pub async fn identify_system(&self) -> Result<(String, String), ReplicationClientError> {
+        for message in self.postgres_client.simple_query("IDENTIFY_SYSTEM").await? {
+            if let SimpleQueryMessage::Row(row) = message {
+                let column = |name: &str| {
+                    row.get(name).map(str::to_string).ok_or_else(|| {
+                        ReplicationClientError::MissingColumn(
+                            name.to_string(),
+                            "identify_system".to_string(),
+                        )
+                    })
+                };
+                return Ok((column("systemid")?, column("dbname")?));
+            }
+        }
+        Err(ReplicationClientError::MissingColumn(
+            "systemid".to_string(),
+            "identify_system".to_string(),
         ))
     }
 
@@ -99,6 +144,7 @@ impl ReplicationClient {
         ReplicationClient {
             postgres_client,
             in_txn: false,
+            snapshot_exporter: None,
         }
     }
 
@@ -126,7 +172,15 @@ impl ReplicationClient {
             self.postgres_client.simple_query("commit;").await?;
             self.in_txn = false;
         }
+        self.release_snapshot_exporter();
         Ok(())
+    }
+
+    fn release_snapshot_exporter(&mut self) {
+        if let Some((client, task)) = self.snapshot_exporter.take() {
+            drop(client);
+            task.abort();
+        }
     }
 
     pub async fn rollback_txn(&mut self) -> Result<(), ReplicationClientError> {
@@ -134,6 +188,7 @@ impl ReplicationClient {
             self.postgres_client.simple_query("rollback;").await?;
             self.in_txn = false;
         }
+        self.release_snapshot_exporter();
         Ok(())
     }
 
@@ -141,12 +196,18 @@ impl ReplicationClient {
         &mut self,
         table_name: &TableName,
     ) -> Result<(), ReplicationClientError> {
+        // ONLY: without it postgres also adds the table's inheritance children (and fails on a
+        // temporary one); each child that is mirrored is added by its own mirror.
         let query = format!(
-            "ALTER PUBLICATION moonlink_pub ADD TABLE {};",
+            "ALTER PUBLICATION moonlink_pub ADD TABLE ONLY {};",
             table_name.as_quoted_identifier()
         );
-        self.postgres_client.simple_query(&query).await?;
-        Ok(())
+        match self.postgres_client.simple_query(&query).await {
+            Ok(_) => Ok(()),
+            // The publication outlives restarts, so recovered tables are usually still members.
+            Err(e) if e.code() == Some(&SqlState::DUPLICATE_OBJECT) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn get_row_count(
@@ -208,23 +269,69 @@ impl ReplicationClient {
         Ok((stream, current_wal_lsn))
     }
 
-    /// Export a snapshot and capture the current WAL LSN. Keeps the transaction open.
+    /// Export a snapshot for the initial copy together with its exact replication position, and
+    /// open a read-only transaction on it. Keeps the transaction open.
+    ///
+    /// The snapshot comes from a temporary logical slot, so the returned LSN is the slot's
+    /// consistent point: transactions whose commit record starts before it are in the snapshot,
+    /// all later ones are not. `pg_current_wal_lsn()` next to `pg_export_snapshot()` is not such a
+    /// boundary (asynchronous commits become visible before their commit record is written, so they
+    /// ended up both copied and replayed). Creating the slot waits for transactions running at that
+    /// moment to finish.
     pub async fn export_snapshot_and_lsn(
         &mut self,
+        uri: &str,
     ) -> Result<(String, PgLsn), ReplicationClientError> {
-        // Begin a repeatable read, read-only transaction
-        self.postgres_client
-            .simple_query("begin read only isolation level repeatable read;")
-            .await?;
-        self.in_txn = true;
-
-        let lsn = self.get_current_wal_lsn().await?;
-        let row = self
-            .postgres_client
-            .query_one("SELECT pg_export_snapshot();", &[])
-            .await?;
-        let snapshot_id: String = row.get(0);
-        Ok((snapshot_id, lsn))
+        let (exporter, connection) = ReplicationClient::connect(uri, true).await?;
+        let connection_task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                debug!("snapshot exporter connection closed: {}", e);
+            }
+        });
+        let slot_name = format!("moonlink_copy_{}", uuid::Uuid::new_v4().simple());
+        let query = format!(
+            "CREATE_REPLICATION_SLOT {} TEMPORARY LOGICAL pgoutput EXPORT_SNAPSHOT",
+            quote_identifier(&slot_name)
+        );
+        let created = exporter.postgres_client.simple_query(&query).await;
+        let rows = match created {
+            Ok(rows) => rows,
+            Err(e) => {
+                connection_task.abort();
+                return Err(e.into());
+            }
+        };
+        let mut exported = None;
+        for message in rows {
+            if let SimpleQueryMessage::Row(row) = message {
+                let consistent_point: PgLsn = row
+                    .get("consistent_point")
+                    .ok_or(ReplicationClientError::MissingColumn(
+                        "consistent_point".to_string(),
+                        "create_replication_slot".to_string(),
+                    ))?
+                    .parse()
+                    .map_err(|_| ReplicationClientError::InvalidPgLsn)?;
+                let snapshot_name = row
+                    .get("snapshot_name")
+                    .ok_or(ReplicationClientError::MissingColumn(
+                        "snapshot_name".to_string(),
+                        "create_replication_slot".to_string(),
+                    ))?
+                    .to_string();
+                exported = Some((snapshot_name, consistent_point));
+            }
+        }
+        let Some((snapshot_name, consistent_point)) = exported else {
+            connection_task.abort();
+            return Err(ReplicationClientError::FailedToCreateSlot);
+        };
+        self.snapshot_exporter = Some((exporter.postgres_client, connection_task));
+        if let Err(e) = self.begin_with_snapshot(&snapshot_name).await {
+            self.release_snapshot_exporter();
+            return Err(e);
+        }
+        Ok((snapshot_name, consistent_point))
     }
 
     /// Begin a repeatable read, read-only transaction and import a snapshot.
@@ -301,6 +408,7 @@ impl ReplicationClient {
             "{}
             select a.attname,
                 a.atttypid,
+                format_type(a.atttypid, a.atttypmod) as type_name,
                 a.atttypmod,
                 a.attnotnull,
                 a.attndims,
@@ -345,24 +453,26 @@ impl ReplicationClient {
                     .parse()
                     .map_err(|_| ReplicationClientError::OidColumnNotU32)?;
 
-                // Get the Type from OID, handling composite types and arrays recursively
-                let typ = self.resolve_type(type_oid).await.map_err(|_| {
+                let unsupported = || {
+                    let type_name = row.get("type_name").unwrap_or("unknown type");
                     ReplicationClientError::UnsupportedType(
-                        name.clone(),
+                        format!("{name} ({type_name})"),
                         type_oid,
                         table_name.to_string(),
                     )
-                })?;
+                };
+                // Get the Type from OID, handling composite types, arrays, domains and enums
+                // recursively.
+                let typ = self
+                    .resolve_type(type_oid)
+                    .await
+                    .map_err(|_| unsupported())?;
 
                 if !TextFormatConverter::is_supported_type(&typ) {
-                    return Err(ReplicationClientError::UnsupportedType(
-                        name.clone(),
-                        type_oid,
-                        table_name.to_string(),
-                    ));
+                    return Err(unsupported());
                 }
 
-                let modifier = row
+                let modifier: i32 = row
                     .try_get("atttypmod")?
                     .ok_or(ReplicationClientError::MissingColumn(
                         "atttypmod".to_string(),
@@ -370,6 +480,13 @@ impl ReplicationClient {
                     ))?
                     .parse()
                     .map_err(|_| ReplicationClientError::TypeModifierColumnNotI32)?;
+                // A domain column has no modifier of its own; its values follow the domain's
+                // (e.g. numeric(10,2)), which is what the mirror stores.
+                let modifier = if matches!(typ.kind(), Kind::Domain(_)) {
+                    self.domain_type_modifier(type_oid).await?
+                } else {
+                    modifier
+                };
 
                 let attndims: i32 = row
                     .try_get("attndims")?
@@ -381,11 +498,7 @@ impl ReplicationClient {
                     .map_err(|_| ReplicationClientError::TypeModifierColumnNotI32)?;
 
                 if matches!(typ.kind(), Kind::Array(_)) && attndims > 1 {
-                    return Err(ReplicationClientError::UnsupportedType(
-                        name.clone(),
-                        type_oid,
-                        table_name.to_string(),
-                    ));
+                    return Err(unsupported());
                 }
 
                 let nullable =
@@ -423,8 +536,27 @@ impl ReplicationClient {
             }
 
             // Query the database for the type information
-            let (type_name, type_relid, schema_name, type_type, type_elem) =
+            let (type_name, type_relid, schema_name, type_type, type_elem, type_base) =
                 self.get_type_info(type_oid).await?;
+
+            // A domain is stored as its base type; an enum as its label.
+            if type_type == "d" {
+                let base = self.resolve_type(type_base).await?;
+                return Ok(Type::new(
+                    type_name,
+                    type_oid,
+                    Kind::Domain(base),
+                    schema_name,
+                ));
+            }
+            if type_type == "e" {
+                return Ok(Type::new(
+                    type_name,
+                    type_oid,
+                    Kind::Enum(Vec::new()),
+                    schema_name,
+                ));
+            }
 
             // https://www.postgresql.org/docs/current/catalog-pg-type.html
             // composite type (type_type == "c")
@@ -466,13 +598,41 @@ impl ReplicationClient {
         })
     }
 
+    /// The type modifier a domain imposes on its values (the first one along its chain of base
+    /// domains), or -1.
+    async fn domain_type_modifier(&self, type_oid: u32) -> Result<i32, ReplicationClientError> {
+        let mut type_oid = type_oid;
+        loop {
+            let query = format!(
+                "SELECT typtypmod, typbasetype, typtype FROM pg_type WHERE oid = {type_oid}"
+            );
+            let row = self
+                .postgres_client
+                .simple_query(&query)
+                .await?
+                .into_iter()
+                .find_map(|m| match m {
+                    SimpleQueryMessage::Row(row) => Some(row),
+                    _ => None,
+                });
+            let Some(row) = row else {
+                return Ok(-1);
+            };
+            let typmod: i32 = row.get(0).unwrap_or("-1").parse().unwrap_or(-1);
+            if typmod != -1 || row.get(2) != Some("d") {
+                return Ok(typmod);
+            }
+            type_oid = row.get(1).unwrap_or("0").parse().unwrap_or(0);
+        }
+    }
+
     /// Query PostgreSQL type information by OID
     async fn get_type_info(
         &self,
         type_oid: u32,
-    ) -> Result<(String, u32, String, String, u32), ReplicationClientError> {
+    ) -> Result<(String, u32, String, String, u32, u32), ReplicationClientError> {
         let type_query = format!(
-            "SELECT t.typname, t.typrelid, n.nspname, t.typtype, t.typelem
+            "SELECT t.typname, t.typrelid, n.nspname, t.typtype, t.typelem, t.typbasetype
          FROM pg_type t
          JOIN pg_namespace n ON t.typnamespace = n.oid
          WHERE t.oid = {}",
@@ -484,6 +644,7 @@ impl ReplicationClient {
         let mut schema_name = String::new();
         let mut type_type = String::new();
         let mut type_elem = 0;
+        let mut type_base = 0;
 
         // Query should return exactly one row since we're querying by OID which is unique
         let mut row_count = 0;
@@ -494,6 +655,7 @@ impl ReplicationClient {
                 schema_name = row.get("nspname").unwrap().to_string();
                 type_type = row.get("typtype").unwrap().to_string();
                 type_elem = row.get("typelem").unwrap().parse().unwrap_or(0);
+                type_base = row.get("typbasetype").unwrap().parse().unwrap_or(0);
                 row_count += 1;
             }
         }
@@ -503,7 +665,14 @@ impl ReplicationClient {
             type_oid
         );
 
-        Ok((type_name, type_relid, schema_name, type_type, type_elem))
+        Ok((
+            type_name,
+            type_relid,
+            schema_name,
+            type_type,
+            type_elem,
+            type_base,
+        ))
     }
 
     /// Query composite type fields by relation ID

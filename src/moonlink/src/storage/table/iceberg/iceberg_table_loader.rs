@@ -52,6 +52,11 @@ impl IcebergTableManager {
         let file_index_blob =
             FileIndexBlob::load_from_index_blob(file_io.clone(), entry.data_file()).await?;
         let mut cur_iceberg_file_index = file_index_blob.file_index;
+        let index_block_paths: Vec<String> = cur_iceberg_file_index
+            .index_block_files
+            .iter()
+            .map(|b| b.filepath.clone())
+            .collect();
         let table_id = TableId(self.mooncake_table_metadata.table_id);
         let mooncake_file_index = cur_iceberg_file_index
             .as_mooncake_file_index(
@@ -67,6 +72,8 @@ impl IcebergTableManager {
             mooncake_file_index.clone(),
             entry.data_file().file_path().to_string(),
         );
+        self.persisted_index_block_files
+            .insert(entry.data_file().file_path().to_string(), index_block_paths);
 
         Ok(Some(mooncake_file_index))
     }
@@ -135,7 +142,7 @@ impl IcebergTableManager {
         };
         let (cache_handle, evicted_files_to_delete) = self
             .object_storage_cache
-            .get_cache_entry(
+            .get_cache_entry_pinned(
                 unique_file_id,
                 data_file.file_path(),
                 self.filesystem_accessor.as_ref(),
@@ -162,7 +169,7 @@ impl IcebergTableManager {
 
         let persisted_deletion_vector = PuffinBlobRef {
             // Deletion vector should be pinned on cache.
-            puffin_file_cache_handle: cache_handle.unwrap(),
+            puffin_file_cache_handle: cache_handle,
             start_offset: data_file.content_offset().unwrap() as u32,
             blob_size: data_file.content_size_in_bytes().unwrap() as u32,
             num_rows: num_rows as usize,
@@ -182,14 +189,9 @@ impl IcebergTableManager {
     ) -> MooncakeSnapshot {
         let mut mooncake_snapshot = MooncakeSnapshot::new(self.mooncake_table_metadata.clone());
 
-        // Assign snapshot version.
-        let iceberg_table_metadata = self.iceberg_table.as_ref().unwrap().metadata();
-        mooncake_snapshot.snapshot_version =
-            if let Some(ver) = iceberg_table_metadata.current_snapshot_id() {
-                ver as u64
-            } else {
-                0
-            };
+        // The snapshot version is the LSN readers are told the snapshot is at; the recovered state
+        // is what was persisted, at the flush LSN (the iceberg snapshot id is not an LSN).
+        mooncake_snapshot.snapshot_version = flush_lsn.unwrap_or(0);
 
         // Fill in disk files.
         mooncake_snapshot.disk_files = HashMap::with_capacity(self.persisted_data_files.len());
@@ -332,11 +334,13 @@ impl IcebergTableManager {
             }
         }
 
-        let mooncake_snapshot = self.transform_to_mooncake_snapshot(
+        let mut mooncake_snapshot = self.transform_to_mooncake_snapshot(
             loaded_deletion_vector,
             loaded_file_indices,
             snapshot_property.flush_lsn,
         );
+        // Tables persisted before the property existed used a per-process random hash.
+        mooncake_snapshot.lookup_key_version = snapshot_property.lookup_key_version.unwrap_or(1);
         Ok((next_file_id as u32, mooncake_snapshot))
     }
 }

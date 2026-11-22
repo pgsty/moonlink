@@ -1,7 +1,5 @@
 use async_stream::try_stream;
 use async_trait::async_trait;
-#[cfg(all(feature = "storage-gcs", test))]
-use futures::TryStreamExt;
 use futures::{Stream, StreamExt};
 use opendal::options::WriteOptions;
 use opendal::Metadata;
@@ -20,7 +18,7 @@ use crate::storage::filesystem::accessor::metadata::ObjectMetadata;
 use crate::storage::filesystem::accessor::operator_utils;
 use crate::storage::filesystem::accessor::unbuffered_stream_writer::UnbufferedStreamWriter;
 use crate::storage::filesystem::accessor_config::AccessorConfig;
-#[cfg(feature = "storage-gcs")]
+#[cfg(feature = "storage-fs")]
 use crate::storage::filesystem::storage_config::StorageConfig;
 use crate::Result;
 
@@ -30,6 +28,12 @@ use std::pin::Pin;
 const IO_BLOCK_SIZE: usize = 2 * 1024 * 1024;
 /// Max number of ongoing parallel sub IO operations for one single upload and download operation.
 const MAX_SUB_IO_OPERATION: usize = 8;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: make hard linking report "not possible" to exercise the copy fallback.
+    static FORCE_LINK_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 // TODO(hjiang): Add stats cache for exists, get file size, etc invocation.
 pub struct FileSystemAccessor {
@@ -87,6 +91,31 @@ impl FileSystemAccessor {
             .await
     }
 
+    /// On the local filesystem, make the rename that completed an atomic write durable: without
+    /// a directory fsync, a power loss can undo it (e.g. roll back the version hint while the
+    /// replication slot was already acknowledged past it).
+    // Irrefutable when the local filesystem is the only storage backend compiled in.
+    #[allow(irrefutable_let_patterns)]
+    async fn sync_parent_directory(&self, object: &str) -> Result<()> {
+        #[cfg(feature = "storage-fs")]
+        if let crate::storage::filesystem::storage_config::StorageConfig::FileSystem {
+            root_directory,
+            ..
+        } = &self.config.storage_config
+        {
+            let relative = self.sanitize_path(object).trim_start_matches('/');
+            let path = std::path::Path::new(root_directory).join(relative);
+            if let Some(parent) = path.parent() {
+                let parent = parent.to_path_buf();
+                tokio::task::spawn_blocking(move || std::fs::File::open(&parent)?.sync_all())
+                    .await??;
+            }
+        }
+        #[cfg(not(feature = "storage-fs"))]
+        let _ = object;
+        Ok(())
+    }
+
     /// Util function to get local file size.
     async fn get_local_file_size(path: &str) -> Result<u64> {
         let file = tokio::fs::File::open(path).await?;
@@ -125,24 +154,76 @@ impl FileSystemAccessor {
         Ok(ObjectMetadata { size: file_size })
     }
 
-    /// Get multi-part upload trigger threshold.
-    fn get_multipart_upload_threshold(&self) -> Option<usize> {
+    /// Absolute local path of `path` when the accessor is backed by the local filesystem.
+    #[cfg(feature = "storage-fs")]
+    fn local_absolute_path(&self, path: &str) -> Option<std::path::PathBuf> {
         match &self.config.storage_config {
-            #[cfg(feature = "storage-gcs")]
-            StorageConfig::Gcs {
-                write_option: Some(opt),
-                ..
-            } => opt.multipart_upload_threshold,
+            StorageConfig::FileSystem { root_directory, .. } => {
+                if path.starts_with(root_directory.as_str()) {
+                    Some(std::path::PathBuf::from(path))
+                } else {
+                    Some(std::path::Path::new(root_directory).join(path.trim_start_matches('/')))
+                }
+            }
+            #[allow(unreachable_patterns)]
             _ => None,
         }
     }
 
+    /// Publish a local file into a local-filesystem store without copying its bytes: make it
+    /// durable, then hard link it under the destination name. Both names refer to the same
+    /// inode. Moonlink never rewrites a data or index file in place, so readers holding the
+    /// source name are unaffected, and that name is removed later by the normal cache eviction.
+    /// Returns `Ok(None)` when linking isn't possible (e.g. another filesystem), so the caller
+    /// falls back to copying.
+    #[cfg(feature = "storage-fs")]
+    async fn try_hard_link_local(&self, src: &str, dst: &str) -> Result<Option<ObjectMetadata>> {
+        let Some(dst_path) = self.local_absolute_path(dst) else {
+            return Ok(None);
+        };
+        #[cfg(test)]
+        if FORCE_LINK_FAILURE.with(|f| f.get()) {
+            return Ok(None);
+        }
+        let src_path = std::path::PathBuf::from(src);
+        let linked = tokio::task::spawn_blocking(move || -> std::io::Result<Option<u64>> {
+            let file = std::fs::File::open(&src_path)?;
+            file.sync_all()?;
+            let size = file.metadata()?.len();
+            let parent = dst_path.parent().map(|p| p.to_path_buf());
+            if let Some(parent) = &parent {
+                std::fs::create_dir_all(parent)?;
+            }
+            match std::fs::hard_link(&src_path, &dst_path) {
+                Ok(()) => {}
+                // Already the same file (a previous attempt linked it, or both paths resolve to
+                // one): removing the destination would delete the source too.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        && is_same_file(&file, &dst_path)? => {}
+                // A previous attempt (e.g. a retried persistence) may have left the destination.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::fs::remove_file(&dst_path)?;
+                    if std::fs::hard_link(&src_path, &dst_path).is_err() {
+                        return Ok(None);
+                    }
+                }
+                // Cross-device, unsupported by the filesystem, link limits, permissions.
+                Err(_) => return Ok(None),
+            }
+            if let Some(parent) = parent {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(Some(size))
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        Ok(linked.map(|size| ObjectMetadata { size }))
+    }
+
     /// Get option for write options, use default if unspecified.
     fn get_write_option(&self) -> WriteOptions {
-        WriteOptions {
-            chunk: self.get_multipart_upload_threshold(),
-            ..Default::default()
-        }
+        WriteOptions::default()
     }
 }
 
@@ -177,42 +258,22 @@ impl BaseFileSystemAccess for FileSystemAccessor {
         Ok(dirs)
     }
 
-    // TODO(hjiang): Remove this test function once fake-gcs fix the sending empty body will be error issue.
-    #[cfg(all(feature = "storage-gcs", test))]
-    async fn remove_directory(&self, directory: &str) -> Result<()> {
-        let path = if directory.ends_with('/') {
-            directory.to_string()
-        } else {
-            format!("{directory}/")
-        };
-        let sanitized_path = self.sanitize_path(&path);
-
-        let operator = self.get_operator().await?;
-        let mut lister = operator.lister(sanitized_path).await?;
-        let mut entries = Vec::new();
-
-        while let Some(entry) = lister.try_next().await? {
-            // List operation returns target path.
-            if entry.path() != sanitized_path {
-                entries.push(entry.path().to_string());
+    async fn list_direct_files(&self, folder: &str) -> Result<Vec<String>> {
+        let sanitized_folder = self.sanitize_path(folder);
+        let prefix = format!("{sanitized_folder}/");
+        let mut files = Vec::new();
+        for cur_entry in self.get_operator().await?.list(&prefix).await?.iter() {
+            if cur_entry.path().ends_with('/') {
+                continue;
+            }
+            let file_name = cur_entry.path().trim_start_matches(&prefix).to_string();
+            if !file_name.is_empty() && !file_name.contains('/') {
+                files.push(file_name);
             }
         }
-        for entry_path in entries {
-            if entry_path.ends_with('/') {
-                Box::pin(self.remove_directory(&entry_path)).await?;
-            } else {
-                operator.delete(&entry_path).await?;
-            }
-        }
-
-        if !sanitized_path.is_empty() && sanitized_path != "/" {
-            operator.remove_all(sanitized_path).await?;
-        }
-
-        Ok(())
+        Ok(files)
     }
 
-    #[cfg(not(all(feature = "storage-gcs", test)))]
     async fn remove_directory(&self, directory: &str) -> Result<()> {
         let sanitized_directory = self.sanitize_path(directory);
         let op = self.get_operator().await?.clone();
@@ -296,8 +357,22 @@ impl BaseFileSystemAccess for FileSystemAccessor {
         let sanitized_object = self.sanitize_path(object);
         let operator = self.get_operator().await?;
         let expected_len = content.len();
-        let metadata = operator.write(sanitized_object, content).await?;
+        let mut writer = operator.writer(sanitized_object).await?;
+        let written = match writer.write(content).await {
+            Ok(()) => writer.close().await,
+            Err(e) => Err(e),
+        };
+        let metadata = match written {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                // Remove the partial temp file of an atomic write (e.g. on a full disk), which
+                // would otherwise hold on to the space forever.
+                let _ = writer.abort().await;
+                return Err(e.into());
+            }
+        };
         assert_eq!(metadata.content_length(), expected_len as u64);
+        self.sync_parent_directory(object).await?;
         Ok(metadata)
     }
 
@@ -349,6 +424,11 @@ impl BaseFileSystemAccess for FileSystemAccessor {
     }
 
     async fn copy_from_local_to_remote(&self, src: &str, dst: &str) -> Result<ObjectMetadata> {
+        #[cfg(feature = "storage-fs")]
+        if let Some(metadata) = self.try_hard_link_local(src, dst).await? {
+            return Ok(metadata);
+        }
+
         // For small files, no need to parallelize IO operations.
         let sanitized_dst = self.sanitize_path(dst);
         let file_size = Self::get_local_file_size(src).await?;
@@ -380,7 +460,10 @@ impl BaseFileSystemAccess for FileSystemAccessor {
                 if n == 0 {
                     break;
                 }
-                tx.send(buffer[..n].to_vec()).await.unwrap();
+                // The writer stopped after an error, which is reported below.
+                if tx.send(buffer[..n].to_vec()).await.is_err() {
+                    break;
+                }
             }
             Ok::<(), std::io::Error>(())
         });
@@ -390,15 +473,28 @@ impl BaseFileSystemAccess for FileSystemAccessor {
         let mut writer = operator
             .writer_options(sanitized_dst, self.get_write_option())
             .await?;
-        while let Some(cur_chunk) = rx.recv().await {
-            let cur_byte_len = cur_chunk.len();
-            writer.write(cur_chunk).await?;
-            total_size += cur_byte_len as u64;
+        let written: std::result::Result<(), opendal::Error> = async {
+            while let Some(cur_chunk) = rx.recv().await {
+                let cur_byte_len = cur_chunk.len();
+                writer.write(cur_chunk).await?;
+                total_size += cur_byte_len as u64;
+            }
+            writer.close().await?;
+            Ok(())
         }
-        writer.close().await?;
+        .await;
+        if let Err(e) = written {
+            // As in write_object: drop the partial temp file of the atomic write.
+            let _ = writer.abort().await;
+            drop(rx);
+            let _ = reader_task_handle.await;
+            return Err(e.into());
+        }
 
         // Wait for reader task to finish.
         reader_task_handle.await??;
+        // Make the new directory entry durable before metadata referencing the file is written.
+        self.sync_parent_directory(dst).await?;
 
         Ok(ObjectMetadata { size: total_size })
     }
@@ -461,6 +557,14 @@ impl BaseFileSystemAccess for FileSystemAccessor {
     }
 }
 
+/// Whether `path` names the same inode as the open `file`.
+#[cfg(feature = "storage-fs")]
+fn is_same_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let (a, b) = (file.metadata()?, std::fs::metadata(path)?);
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +602,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(metadata.content_length(), TARGET_FILESIZE as u64);
+    }
+
+    fn atomic_tmp_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let dir = root.join(
+            crate::storage::filesystem::accessor::operator_utils::DEFAULT_ATOMIC_WRITE_SUBDIR,
+        );
+        std::fs::read_dir(dir)
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
+    }
+
+    /// A write that fails after its temp file was written (here: the final rename, because the
+    /// target is a directory) leaves neither a partial target nor a temp file behind.
+    #[tokio::test]
+    async fn test_failed_atomic_write_leaves_no_temp_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage_config = StorageConfig::FileSystem {
+            root_directory: temp_dir.path().to_str().unwrap().to_string(),
+            atomic_write_dir: None,
+        };
+        let accessor =
+            create_filesystem_accessor(AccessorConfig::new_with_storage_config(storage_config));
+        let target = temp_dir.path().join("t").join("v1.metadata.json");
+        std::fs::create_dir_all(target.join("occupied")).unwrap();
+
+        let res = accessor
+            .write_object("t/v1.metadata.json", vec![7u8; 1 << 20])
+            .await;
+        assert!(res.is_err());
+        assert!(target.is_dir(), "target replaced by a partial file");
+        let leftovers = atomic_tmp_files(temp_dir.path());
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+
+        // Writes go through the temp directory by default.
+        accessor
+            .write_object("t/v2.metadata.json", b"ok".to_vec())
+            .await
+            .unwrap();
+        assert!(atomic_tmp_files(temp_dir.path()).is_empty());
+        assert!(
+            temp_dir
+                .path()
+                .join(crate::storage::filesystem::accessor::operator_utils::DEFAULT_ATOMIC_WRITE_SUBDIR)
+                .is_dir(),
+            "writes do not go through a temp file"
+        );
+        assert_eq!(
+            std::fs::read(temp_dir.path().join("t").join("v2.metadata.json")).unwrap(),
+            b"ok"
+        );
+    }
+
+    /// Same for a file above the block size, which is copied through a streaming writer.
+    #[tokio::test]
+    async fn test_failed_large_copy_leaves_no_temp_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage_config = StorageConfig::FileSystem {
+            root_directory: temp_dir.path().to_str().unwrap().to_string(),
+            atomic_write_dir: None,
+        };
+        let accessor =
+            create_filesystem_accessor(AccessorConfig::new_with_storage_config(storage_config));
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("large.parquet");
+        std::fs::write(&source, vec![7u8; IO_BLOCK_SIZE * 2 + 1]).unwrap();
+        let target = temp_dir.path().join("t").join("data").join("large.parquet");
+        std::fs::create_dir_all(target.join("occupied")).unwrap();
+
+        let res = accessor
+            .copy_from_local_to_remote(source.to_str().unwrap(), "t/data/large.parquet")
+            .await;
+        assert!(res.is_err());
+        assert!(target.is_dir(), "target replaced by a partial file");
+        let leftovers = atomic_tmp_files(temp_dir.path());
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+
+        accessor
+            .copy_from_local_to_remote(source.to_str().unwrap(), "t/data/other.parquet")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(temp_dir.path().join("t").join("data").join("other.parquet"))
+                .unwrap()
+                .len(),
+            (IO_BLOCK_SIZE * 2 + 1) as u64
+        );
+        assert!(atomic_tmp_files(temp_dir.path()).is_empty());
+    }
+
+    /// Temp files a crash left behind are deleted before this process first writes there.
+    #[tokio::test]
+    async fn test_leftover_atomic_write_files_are_removed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let tmp_dir = temp_dir.path().join(
+            crate::storage::filesystem::accessor::operator_utils::DEFAULT_ATOMIC_WRITE_SUBDIR,
+        );
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        std::fs::write(tmp_dir.join("partial-write"), vec![1u8; 4096]).unwrap();
+        let storage_config = StorageConfig::FileSystem {
+            root_directory: temp_dir.path().to_str().unwrap().to_string(),
+            atomic_write_dir: None,
+        };
+        let accessor =
+            create_filesystem_accessor(AccessorConfig::new_with_storage_config(storage_config));
+        accessor
+            .write_object("t/file", b"content".to_vec())
+            .await
+            .unwrap();
+        assert!(atomic_tmp_files(temp_dir.path()).is_empty());
     }
 
     // Test atomic write operation for local filesystem.
@@ -641,6 +860,128 @@ mod tests {
             .unwrap();
         assert_eq!(actual_content.len(), expected_content.len());
         assert_eq!(actual_content, expected_content);
+    }
+
+    fn fs_accessor_for_test(root_directory: &str) -> FileSystemAccessor {
+        FileSystemAccessor::new(AccessorConfig::new_with_storage_config(
+            StorageConfig::FileSystem {
+                root_directory: root_directory.to_string(),
+                atomic_write_dir: None,
+            },
+        ))
+    }
+
+    /// On a local filesystem the bytes are not copied: the destination is a hard link to the
+    /// source (same inode), and survives removal of the source name.
+    #[tokio::test]
+    async fn test_copy_from_local_to_remote_hard_links_on_local_fs() {
+        use std::os::unix::fs::MetadataExt;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root_directory = temp_dir.path().to_str().unwrap().to_string();
+        let filesystem_accessor = fs_accessor_for_test(&root_directory);
+        let src_filepath = format!("{root_directory}/src");
+        std::fs::write(&src_filepath, b"parquet bytes").unwrap();
+        let dst_filepath = format!("{root_directory}/ns/table/data/dst.parquet");
+        let metadata = filesystem_accessor
+            .copy_from_local_to_remote(&src_filepath, &dst_filepath)
+            .await
+            .unwrap();
+        assert_eq!(metadata.size, 13);
+        let src_md = std::fs::metadata(&src_filepath).unwrap();
+        let dst_md = std::fs::metadata(&dst_filepath).unwrap();
+        assert_eq!(src_md.ino(), dst_md.ino());
+        assert_eq!(dst_md.nlink(), 2);
+        std::fs::remove_file(&src_filepath).unwrap();
+        assert_eq!(std::fs::read(&dst_filepath).unwrap(), b"parquet bytes");
+
+        // Relative destination paths resolve under the root, like opendal does.
+        std::fs::write(&src_filepath, b"x").unwrap();
+        filesystem_accessor
+            .copy_from_local_to_remote(&src_filepath, "rel/dst2")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(format!("{root_directory}/rel/dst2"))
+                .unwrap()
+                .ino(),
+            std::fs::metadata(&src_filepath).unwrap().ino()
+        );
+    }
+
+    /// A destination left behind by an earlier attempt is replaced.
+    #[tokio::test]
+    async fn test_copy_from_local_to_remote_replaces_existing_destination() {
+        use std::os::unix::fs::MetadataExt;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root_directory = temp_dir.path().to_str().unwrap().to_string();
+        let filesystem_accessor = fs_accessor_for_test(&root_directory);
+        let src_filepath = format!("{root_directory}/src");
+        let dst_filepath = format!("{root_directory}/dst");
+        std::fs::write(&src_filepath, b"new").unwrap();
+        std::fs::write(&dst_filepath, b"stale partial").unwrap();
+        let metadata = filesystem_accessor
+            .copy_from_local_to_remote(&src_filepath, &dst_filepath)
+            .await
+            .unwrap();
+        assert_eq!(metadata.size, 3);
+        assert_eq!(std::fs::read(&dst_filepath).unwrap(), b"new");
+        assert_eq!(
+            std::fs::metadata(&src_filepath).unwrap().ino(),
+            std::fs::metadata(&dst_filepath).unwrap().ino()
+        );
+    }
+
+    /// A destination that already is the source (a retried link, or a path resolving to the
+    /// source itself) is kept, not deleted.
+    #[tokio::test]
+    async fn test_copy_from_local_to_remote_keeps_destination_that_is_the_source() {
+        use std::os::unix::fs::MetadataExt;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root_directory = temp_dir.path().to_str().unwrap().to_string();
+        let filesystem_accessor = fs_accessor_for_test(&root_directory);
+        let src_filepath = format!("{root_directory}/src");
+        std::fs::write(&src_filepath, b"parquet bytes").unwrap();
+        let ino = std::fs::metadata(&src_filepath).unwrap().ino();
+
+        let dst_filepath = format!("{root_directory}/dst");
+        for _ in 0..2 {
+            let metadata = filesystem_accessor
+                .copy_from_local_to_remote(&src_filepath, &dst_filepath)
+                .await
+                .unwrap();
+            assert_eq!(metadata.size, 13);
+            assert_eq!(std::fs::metadata(&dst_filepath).unwrap().ino(), ino);
+        }
+        let metadata = filesystem_accessor
+            .copy_from_local_to_remote(&src_filepath, "src")
+            .await
+            .unwrap();
+        assert_eq!(metadata.size, 13);
+        assert_eq!(std::fs::read(&src_filepath).unwrap(), b"parquet bytes");
+        assert_eq!(std::fs::metadata(&src_filepath).unwrap().ino(), ino);
+    }
+
+    /// When linking isn't possible (e.g. the store is on another filesystem) the bytes are copied.
+    #[tokio::test]
+    async fn test_copy_from_local_to_remote_falls_back_to_copy() {
+        use std::os::unix::fs::MetadataExt;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root_directory = temp_dir.path().to_str().unwrap().to_string();
+        let filesystem_accessor = fs_accessor_for_test(&root_directory);
+        let src_filepath = format!("{root_directory}/src");
+        std::fs::write(&src_filepath, b"parquet bytes").unwrap();
+        let dst_filepath = format!("{root_directory}/dst");
+        FORCE_LINK_FAILURE.with(|f| f.set(true));
+        let res = filesystem_accessor
+            .copy_from_local_to_remote(&src_filepath, &dst_filepath)
+            .await;
+        FORCE_LINK_FAILURE.with(|f| f.set(false));
+        assert_eq!(res.unwrap().size, 13);
+        assert_eq!(std::fs::read(&dst_filepath).unwrap(), b"parquet bytes");
+        assert_ne!(
+            std::fs::metadata(&src_filepath).unwrap().ino(),
+            std::fs::metadata(&dst_filepath).unwrap().ino()
+        );
     }
 
     #[tokio::test]

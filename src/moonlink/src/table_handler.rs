@@ -11,23 +11,48 @@
 use crate::event_sync::EventSyncSender;
 use crate::storage::mooncake_table::replay::replay_events::MooncakeTableEvent;
 use crate::storage::mooncake_table::AlterTableRequest;
+use crate::storage::mooncake_table::TableDropper;
 use crate::storage::snapshot_options::IcebergSnapshotOption;
 use crate::storage::snapshot_options::MaintenanceOption;
 use crate::storage::snapshot_options::SnapshotOption;
+use crate::storage::task_supervisor::panic_message;
 use crate::storage::{io_utils, MooncakeTable};
 use crate::table_handler_timer::TableHandlerTimer;
 use crate::table_notify::TableEvent;
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::Instrument;
-use tracing::{debug, error, info_span};
+use tracing::{debug, error, info_span, warn};
 pub(crate) mod table_handler_state;
 use table_handler_state::{
     MaintenanceProcessStatus, MaintenanceRequestStatus, SpecialTableState, TableHandlerState,
+    MAX_CONSECUTIVE_PERSISTENCE_FAILURES,
 };
 
 const MAX_BUFFERED_TABLE_EVENTS: usize = 32_768;
+
+/// How long the DROP of an errored table waits for in-flight background tasks before deleting
+/// the table files anyway.
+const ERRORED_DROP_BACKGROUND_TASK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// DROP of an errored table: requested once, completed when no background task can touch the
+/// table files any more (or after a timeout).
+struct ErroredDrop {
+    pending: bool,
+    background_task_wait: std::time::Duration,
+}
+
+impl Default for ErroredDrop {
+    fn default() -> Self {
+        Self {
+            pending: false,
+            background_task_wait: ERRORED_DROP_BACKGROUND_TASK_WAIT,
+        }
+    }
+}
 
 /// Handler for table operations
 pub struct TableHandler {
@@ -54,6 +79,13 @@ impl TableHandler {
         // Create channel for events
         let (event_sender, event_receiver) = mpsc::channel(MAX_BUFFERED_TABLE_EVENTS);
 
+        // A recovered table has persisted everything up to its snapshot; report that before the
+        // replication slot is first acknowledged, so the slot never moves past what it still needs.
+        advance_flush_lsn(
+            &event_sync_sender.flush_lsn_tx,
+            table.get_persistence_snapshot_lsn().unwrap_or(0),
+        );
+
         // Register channel for internal control events.
         table.register_table_notify(event_sender.clone()).await;
         // Register channel for mooncake table events replay.
@@ -63,16 +95,10 @@ impl TableHandler {
         let table_handler_event_sender = event_sender.clone();
         let event_sender_for_periodical_snapshot = event_sender.clone();
         let event_sender_for_periodical_force_snapshot = event_sender.clone();
-        let event_sender_for_periodical_wal = event_sender.clone();
         let periodic_event_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     // Sending to channel fails only happens when eventloop exits, directly exit timer events.
-                    _ = table_handler_timer.wal_snapshot_timer.tick() => {
-                        if event_sender_for_periodical_wal.send(TableEvent::PeriodicalPersistenceUpdateWal(uuid::Uuid::new_v4())).await.is_err() {
-                            return;
-                        }
-                    }
                     _ = table_handler_timer.mooncake_snapshot_timer.tick() => {
                         if event_sender_for_periodical_snapshot.send(TableEvent::PeriodicalMooncakeTableSnapshot(uuid::Uuid::new_v4())).await.is_err() {
                            return;
@@ -90,18 +116,38 @@ impl TableHandler {
             }
         });
 
+        // If the event loop itself panics, a minimal loop keeps serving the table's channel: it
+        // marks the table errored, fails waiters and still performs DROP.
+        let fallback = EventLoopPanicFallback {
+            dropper: table.dropper(),
+            table_name: table.mooncake_table_id().to_string(),
+            drop_completion_tx: event_sync_sender.drop_table_completion_tx.clone(),
+            force_snapshot_completion_tx: event_sync_sender.force_snapshot_completion_tx.clone(),
+            table_maintenance_completion_tx: event_sync_sender
+                .table_maintenance_completion_tx
+                .clone(),
+            table_status_tx: event_sync_sender.table_status_tx.clone(),
+        };
+
         // Spawn the task with the oneshot receiver
         let event_handle = Some(tokio::spawn(
             async move {
-                Self::event_loop(
+                let mut event_receiver = event_receiver;
+                let result = AssertUnwindSafe(Self::event_loop(
                     table_handler_event_sender,
                     event_sync_sender,
-                    event_receiver,
+                    &mut event_receiver,
                     replication_lsn_rx,
                     handler_event_replay_tx,
                     table,
-                )
+                ))
+                .catch_unwind()
                 .await;
+                if let Err(payload) = result {
+                    fallback
+                        .run(&mut event_receiver, panic_message(payload.as_ref()))
+                        .await;
+                }
             }
             .instrument(info_span!("table_event_loop")),
         ));
@@ -124,35 +170,23 @@ impl TableHandler {
     async fn event_loop(
         table_handler_event_sender: Sender<TableEvent>,
         event_sync_sender: EventSyncSender,
-        mut event_receiver: Receiver<TableEvent>,
+        event_receiver: &mut Receiver<TableEvent>,
         replication_lsn_rx: watch::Receiver<u64>,
         handler_event_replay_tx: Option<mpsc::UnboundedSender<TableEvent>>,
         mut table: MooncakeTable,
     ) {
+        // Postgres replays everything after the slot's confirmed LSN, which never exceeds the
+        // iceberg snapshot LSN, so replayed events up to that LSN are already persisted.
         let persistence_snapshot_lsn = table.get_persistence_snapshot_lsn();
-        // Here we indicate that highest completion lsn of 0 indicates that we have not seen any completed WAL events yet.
-        let wal_highest_completion_lsn = table.get_wal_highest_completion_lsn();
-        let wal_curr_file_number = table.get_wal_curr_file_number();
-
-        let initial_persistence_lsn = if wal_curr_file_number > 0 {
-            if let Some(persistence_snapshot_lsn) = persistence_snapshot_lsn {
-                Some(std::cmp::max(
-                    persistence_snapshot_lsn,
-                    wal_highest_completion_lsn,
-                ))
-            } else {
-                Some(wal_highest_completion_lsn)
-            }
-        } else {
-            persistence_snapshot_lsn
-        };
-
         let mut table_handler_state = TableHandlerState::new(
             event_sync_sender.table_maintenance_completion_tx.clone(),
             event_sync_sender.force_snapshot_completion_tx.clone(),
-            initial_persistence_lsn,
+            /*initial_persistence_lsn=*/ persistence_snapshot_lsn,
             persistence_snapshot_lsn,
-        );
+        )
+        .with_table_status_tx(event_sync_sender.table_status_tx.clone());
+        // DROP progress of an errored table.
+        let mut errored_drop = ErroredDrop::default();
 
         // Used to clean up mooncake table status, and send completion notification.
         let drop_table = async |table: &mut MooncakeTable, event_sync_sender: EventSyncSender| {
@@ -168,19 +202,13 @@ impl TableHandler {
                 return;
             }
 
-            // Step-3: delete the WAL files.
-            if let Err(e) = table.drop_wal().await {
-                let _ = event_sync_sender.drop_table_completion_tx.send(Err(e));
-                return;
-            }
-
-            // Step-4: delete the mooncake table.
+            // Step-3: delete the mooncake table.
             if let Err(e) = table.drop_mooncake_table().await {
                 let _ = event_sync_sender.drop_table_completion_tx.send(Err(e));
                 return;
             }
 
-            // Step-5: send back completion notification.
+            // Step-4: send back completion notification.
             let _ = event_sync_sender.drop_table_completion_tx.send(Ok(()));
         };
 
@@ -216,10 +244,74 @@ impl TableHandler {
                 if let Some(replay_tx) = &handler_event_replay_tx {
                     replay_tx.send(event.clone()).unwrap();
                 }
+
+                #[cfg(any(test, feature = "test-utils"))]
+                if matches!(event, TableEvent::KillForTest) {
+                    panic!("table handler killed for testing");
+                }
+
+                #[cfg(test)]
+                if let TableEvent::SetErroredDropWaitForTest { wait } = event {
+                    errored_drop.background_task_wait = wait;
+                    continue;
+                }
+                #[cfg(test)]
+                if let TableEvent::SetGcGraceForTest { grace } = event {
+                    table.set_gc_grace_for_test(grace);
+                    continue;
+                }
+
+                // ==============================
+                // Errored state
+                // ==============================
+                //
+                if let TableEvent::MooncakeTableSnapshotResult {
+                    mooncake_snapshot_result,
+                } = &event
+                {
+                    if let Some(reason) = &mooncake_snapshot_result.unmatched_deletions {
+                        if Self::enter_errored(&mut table_handler_state, &table, reason.clone())
+                            == Some(true)
+                        {
+                            Self::request_errored_drop(
+                                &mut errored_drop,
+                                &table_handler_event_sender,
+                            );
+                        }
+                    }
+                }
+                if table_handler_state.is_errored()
+                    || matches!(
+                        event,
+                        TableEvent::EnterErrored { .. } | TableEvent::BackgroundTaskFailed { .. }
+                    )
+                {
+                    let drop_now = Self::process_errored_table_event(
+                        event,
+                        &mut table,
+                        &mut table_handler_state,
+                        &mut errored_drop,
+                        &table_handler_event_sender,
+                    )
+                    .await;
+                    if drop_now {
+                        Self::drop_errored_table(&mut table, event_sync_sender).await;
+                        return;
+                    }
+                    continue;
+                }
+
                 match event {
                     event if event.is_ingest_event() => {
                         Self::process_cdc_table_event(event, &mut table, &mut table_handler_state)
                             .await;
+                    }
+                    TableEvent::ReplicationProgress { lsn } => {
+                        if table_handler_state
+                            .has_no_unpersisted_commit(table.get_persistence_snapshot_lsn())
+                        {
+                            advance_flush_lsn(&event_sync_sender.flush_lsn_tx, lsn);
+                        }
                     }
                     // ==============================
                     // Bulk ingestion events
@@ -229,6 +321,16 @@ impl TableHandler {
                         storage_config,
                         lsn,
                     } => {
+                        if table_handler_state.special_table_state == SpecialTableState::InitialCopy
+                        {
+                            if !files.is_empty() {
+                                table_handler_state.initial_copy_loaded_files = true;
+                            }
+                        } else {
+                            // A bulk load is a commit at `lsn` that has to be persisted too.
+                            table_handler_state.latest_commit_lsn =
+                                table_handler_state.latest_commit_lsn.max(Some(lsn));
+                        }
                         table.batch_ingest(files, storage_config, lsn).await;
                     }
 
@@ -332,6 +434,8 @@ impl TableHandler {
                     // Branch to drop the iceberg table and clear pinned data files from the global object storage cache, only used when the whole table requested to drop.
                     // So we block wait for asynchronous request completion.
                     TableEvent::DropTable => {
+                        // A flush waiting for disk space would hold up the drop for its whole wait.
+                        table.cancel_flushes_waiting_for_disk_space();
                         // Fast-path: no other concurrent events, directly clean up states and ack back.
                         if table_handler_state.can_drop_table_now(table.has_ongoing_flush()) {
                             drop_table(&mut table, event_sync_sender).await;
@@ -372,9 +476,6 @@ impl TableHandler {
                             }
                         }
                         table_handler_state.finish_initial_copy(start_lsn);
-
-                        // Drop any events that have LSN less than the start LSN during apply.
-                        table_handler_state.initial_persistence_lsn = Some(start_lsn);
                         // Apply the buffered events.
                         Self::process_blocked_events(&mut table, &mut table_handler_state).await;
                     }
@@ -383,19 +484,6 @@ impl TableHandler {
                     // ==============================
                     //
                     TableEvent::PeriodicalMooncakeTableSnapshot(uuid) => {
-                        // Replication may advance without a new commit or persistence
-                        // result for this table (including a completely empty table).
-                        if let Some(requested_lsn) = table_handler_state.largest_force_snapshot_lsn
-                        {
-                            let persisted_lsn = table_handler_state.get_persisted_table_lsn(
-                                table.get_persistence_snapshot_lsn(),
-                                *replication_lsn_rx.borrow(),
-                            );
-                            if persisted_lsn >= requested_lsn {
-                                table_handler_state.notify_persisted_table_lsn(persisted_lsn);
-                                table_handler_state.largest_force_snapshot_lsn = None;
-                            }
-                        }
                         // Only create a periodic snapshot if there isn't already one in progress
                         if table_handler_state.mooncake_snapshot_ongoing {
                             continue;
@@ -407,16 +495,8 @@ impl TableHandler {
                             // flush if needed
                             if let Some(commit_lsn) = table_handler_state.table_consistent_view_lsn
                             {
-                                // The requested database LSN may belong to a different
-                                // table. Once replication covers it, flush our older
-                                // committed rows without waiting for another write here.
-                                let progress_lsn =
-                                    std::cmp::max(commit_lsn, *replication_lsn_rx.borrow());
-                                if table.get_last_flush_lsn() < commit_lsn
-                                    && table_handler_state.should_force_flush(
-                                        progress_lsn,
-                                        table.get_last_flush_lsn(),
-                                    )
+                                if table_handler_state
+                                    .should_force_flush(commit_lsn, table.get_last_flush_lsn())
                                 {
                                     let event_id = uuid::Uuid::new_v4();
                                     table.flush(commit_lsn, event_id).unwrap();
@@ -530,7 +610,8 @@ impl TableHandler {
                             min_pending_flush_lsn,
                             table_handler_state.persistence_snapshot_result_consumed,
                             table_handler_state.persistence_snapshot_ongoing,
-                        ) {
+                        ) && table_handler_state.persistence_backoff_elapsed()
+                        {
                             if let Some(persistence_snapshot_payload) =
                                 mooncake_snapshot_result.persistence_snapshot_payload
                             {
@@ -657,12 +738,14 @@ impl TableHandler {
                                         .send(Ok(()));
                                 }
 
+                                table_handler_state.record_persistence_success();
+
                                 // Buffer iceberg persistence result, which later will be reflected to mooncake snapshot.
                                 let iceberg_flush_lsn = snapshot_res.flush_lsn;
-                                event_sync_sender
-                                    .flush_lsn_tx
-                                    .send(iceberg_flush_lsn)
-                                    .unwrap();
+                                advance_flush_lsn(
+                                    &event_sync_sender.flush_lsn_tx,
+                                    iceberg_flush_lsn,
+                                );
                                 table.set_persistence_snapshot_res(snapshot_res);
                                 table_handler_state.persistence_snapshot_result_consumed = false;
 
@@ -674,6 +757,32 @@ impl TableHandler {
                                 );
                             }
                             Err(e) => {
+                                // Take the table manager back; an unknown commit outcome or a
+                                // lost manager cannot be retried safely.
+                                let manager_recovered = table.on_persistence_failed();
+                                let outcome_unknown = !manager_recovered
+                                    || matches!(e, crate::Error::IcebergCommitOutcomeUnknown(_));
+                                let failures = if e.is_storage_full() {
+                                    table_handler_state.record_persistence_failure_on_full_disk()
+                                } else {
+                                    table_handler_state.record_persistence_failure()
+                                };
+                                error!(
+                                    error = ?e,
+                                    table = table.mooncake_table_id(),
+                                    failures,
+                                    "iceberg persistence failed"
+                                );
+                                let errored_reason = if outcome_unknown {
+                                    Some(format!("iceberg persistence failed and its outcome is unknown: {e}"))
+                                } else if failures >= MAX_CONSECUTIVE_PERSISTENCE_FAILURES {
+                                    Some(format!(
+                                        "iceberg persistence failed {failures} times in a row, last error: {e}"
+                                    ))
+                                } else {
+                                    None
+                                };
+
                                 if table_handler_state.has_pending_force_snapshot_request() {
                                     if let Err(send_err) = table_handler_state
                                         .force_snapshot_completion_tx
@@ -697,6 +806,23 @@ impl TableHandler {
 
                                 // If iceberg snapshot fails, send error back to all broadcast subscribers and unset force snapshot requests.
                                 table_handler_state.largest_force_snapshot_lsn = None;
+
+                                if let Some(reason) = errored_reason {
+                                    if Self::process_errored_table_event(
+                                        TableEvent::EnterErrored { reason },
+                                        &mut table,
+                                        &mut table_handler_state,
+                                        &mut errored_drop,
+                                        &table_handler_event_sender,
+                                    )
+                                    .await
+                                    {
+                                        Self::drop_errored_table(&mut table, event_sync_sender)
+                                            .await;
+                                        return;
+                                    }
+                                    continue;
+                                }
                             }
                         }
 
@@ -709,7 +835,9 @@ impl TableHandler {
                         }
                     }
                     TableEvent::IndexMergeResult { index_merge_result } => {
-                        table_handler_state.mark_index_merge_completed().await;
+                        table_handler_state
+                            .mark_index_merge_completed(&index_merge_result)
+                            .await;
                         match index_merge_result {
                             Ok(index_merge_result) => {
                                 table.record_index_merge_completion(&index_merge_result);
@@ -726,6 +854,11 @@ impl TableHandler {
                             }
                             Err(err) => {
                                 error!(error = ?err, "failed to perform index merge");
+                                Self::log_if_background_maintenance_stopped(
+                                    &table_handler_state,
+                                    &table,
+                                );
+                                table.on_index_merge_failed();
                             }
                         }
                     }
@@ -743,6 +876,11 @@ impl TableHandler {
                             Err(err) => {
                                 // TODO(hjiang): Need to record failed compaction result back to snapshot, so committed deletion logs could be pruned.
                                 error!(error = ?err, "failed to perform compaction");
+                                Self::log_if_background_maintenance_stopped(
+                                    &table_handler_state,
+                                    &table,
+                                );
+                                table.on_data_compaction_failed();
                             }
                         }
                         // Check whether need to drop table.
@@ -755,49 +893,6 @@ impl TableHandler {
                     }
                     TableEvent::EvictedFilesToDelete { evicted_files } => {
                         start_task_to_delete_evicted(evicted_files.files);
-                    }
-                    TableEvent::PeriodicalPersistenceUpdateWal(uuid) => {
-                        if !table_handler_state.wal_persist_ongoing {
-                            table_handler_state.wal_persist_ongoing = true;
-                            let ongoing_persist_truncate = table.do_wal_persistence_update(uuid);
-                            table_handler_state.wal_persist_ongoing = ongoing_persist_truncate;
-                        }
-                    }
-                    TableEvent::PeriodicalWalPersistenceUpdateResult { result } => {
-                        match result {
-                            Ok(result) => {
-                                if let Some(highest_lsn) =
-                                    table.handle_completed_wal_persistence_update(&result)
-                                {
-                                    event_sync_sender
-                                        .wal_flush_lsn_tx
-                                        .send(highest_lsn)
-                                        .unwrap();
-                                }
-                                table_handler_state.wal_persist_ongoing = false;
-
-                                // Check whether need to drop table.
-                                if table_handler_state.special_table_state
-                                    == SpecialTableState::DropTable
-                                    && table_handler_state
-                                        .can_drop_table_now(table.has_ongoing_flush())
-                                {
-                                    drop_table(&mut table, event_sync_sender).await;
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                error!(error = %e, "failed to persist wal");
-                            }
-                        }
-                    }
-                    TableEvent::FinishRecovery {
-                        highest_completion_lsn,
-                    } => {
-                        event_sync_sender
-                            .wal_flush_lsn_tx
-                            .send(highest_completion_lsn)
-                            .unwrap();
                     }
                     TableEvent::FlushResult {
                         event_id,
@@ -822,8 +917,22 @@ impl TableHandler {
                             }
                         }
                         Some(Err(e)) => {
-                            error!(error = ?e, "failed to flush disk slice");
-                            panic!("Fatal flush error: {e:?}");
+                            // The flush task already retried; the rows cannot be made durable.
+                            error!(error = ?e, table = table.mooncake_table_id(), "failed to flush disk slice");
+                            if Self::process_errored_table_event(
+                                TableEvent::EnterErrored {
+                                    reason: format!("writing table data to disk failed: {e}"),
+                                },
+                                &mut table,
+                                &mut table_handler_state,
+                                &mut errored_drop,
+                                &table_handler_event_sender,
+                            )
+                            .await
+                            {
+                                Self::drop_errored_table(&mut table, event_sync_sender).await;
+                                return;
+                            }
                         }
                         None => {
                             debug!("flush result is none");
@@ -833,6 +942,10 @@ impl TableHandler {
                     // Replication events
                     // ==============================
                     //
+                    #[cfg(test)]
+                    TableEvent::PanicForTest => {
+                        panic!("event loop panic injected by test");
+                    }
                     _ => {
                         unreachable!("unexpected event: {:?}", event);
                     }
@@ -844,6 +957,207 @@ impl TableHandler {
             error!(error = %e, "failed to shutdown table");
         }
         debug!("all event senders dropped, shutting down table handler");
+    }
+
+    /// Enter the errored state; returns whether a DROP was already pending (None if the table
+    /// was already errored).
+    fn enter_errored(
+        table_handler_state: &mut TableHandlerState,
+        table: &MooncakeTable,
+        reason: String,
+    ) -> Option<bool> {
+        error!(
+            table = table.mooncake_table_id(),
+            reason = %reason,
+            "mirror table entered the errored state; it must be dropped and re-created"
+        );
+        table.cancel_flushes_waiting_for_disk_space();
+        table_handler_state.enter_errored(table.mooncake_table_id(), reason)
+    }
+
+    fn errored_message(table_handler_state: &TableHandlerState, table: &MooncakeTable) -> String {
+        match &table_handler_state.special_table_state {
+            SpecialTableState::Errored { reason } => {
+                crate::Error::errored_table_message(table.mooncake_table_id(), reason)
+            }
+            _ => unreachable!("table is not errored"),
+        }
+    }
+
+    /// Handle one event of an errored table, or the event that makes it errored. Nothing is
+    /// applied to the table any more: waiters get the errored message, and results of background
+    /// tasks that were in flight only release what they hold. Returns whether the table must be
+    /// dropped now.
+    async fn process_errored_table_event(
+        event: TableEvent,
+        table: &mut MooncakeTable,
+        table_handler_state: &mut TableHandlerState,
+        errored_drop: &mut ErroredDrop,
+        table_handler_event_sender: &Sender<TableEvent>,
+    ) -> bool {
+        match event {
+            TableEvent::EnterErrored { reason } => {
+                if Self::enter_errored(table_handler_state, table, reason) == Some(true) {
+                    Self::request_errored_drop(errored_drop, table_handler_event_sender);
+                }
+            }
+            // The failed task stopped counting as in flight when it panicked.
+            TableEvent::BackgroundTaskFailed { task, message } => {
+                let reason = format!("internal error in {task}: {message}");
+                if Self::enter_errored(table_handler_state, table, reason) == Some(true) {
+                    Self::request_errored_drop(errored_drop, table_handler_event_sender);
+                }
+            }
+            TableEvent::DropTable => {
+                Self::request_errored_drop(errored_drop, table_handler_event_sender);
+            }
+            TableEvent::ErroredDropTimeout => {
+                if errored_drop.pending {
+                    warn!(
+                        table = table.mooncake_table_id(),
+                        in_flight = table.in_flight_background_tasks(),
+                        "dropping errored table while background tasks are still running"
+                    );
+                    return true;
+                }
+            }
+            TableEvent::ForceSnapshot { .. } => {
+                let message = Self::errored_message(table_handler_state, table);
+                let _ = table_handler_state
+                    .force_snapshot_completion_tx
+                    .send(Some(Err(crate::Error::table_errored(&message))));
+            }
+            TableEvent::ForceRegularIndexMerge
+            | TableEvent::ForceRegularDataCompaction
+            | TableEvent::ForceFullMaintenance => {
+                let message = Self::errored_message(table_handler_state, table);
+                let _ = table_handler_state
+                    .table_maintenance_completion_tx
+                    .send(Err(crate::Error::table_errored(&message)));
+            }
+            TableEvent::MooncakeTableSnapshotResult {
+                mut mooncake_snapshot_result,
+            } => {
+                table_handler_state.mooncake_snapshot_ongoing = false;
+                let mut evicted =
+                    std::mem::take(&mut mooncake_snapshot_result.evicted_data_files_to_delete);
+                if let Some(payload) = mooncake_snapshot_result
+                    .data_compaction_payload
+                    .take_payload()
+                {
+                    evicted.extend(payload.unpin_referenced_compaction_payload().await);
+                }
+                Self::delete_evicted_files(evicted);
+            }
+            TableEvent::IndexMergeResult { .. } => {
+                table_handler_state.table_maintenance_process_status =
+                    MaintenanceProcessStatus::Unrequested;
+            }
+            TableEvent::DataCompactionResult {
+                data_compaction_result,
+            } => {
+                table_handler_state.table_maintenance_process_status =
+                    MaintenanceProcessStatus::Unrequested;
+                if let Ok(res) = data_compaction_result {
+                    Self::delete_evicted_files(res.evicted_files_to_delete);
+                }
+            }
+            TableEvent::PersistenceSnapshotResult {
+                persistence_snapshot_result,
+            } => {
+                table_handler_state.persistence_snapshot_ongoing = false;
+                match persistence_snapshot_result {
+                    Ok(mut res) => {
+                        if let Some(manager) = res.table_manager.take() {
+                            table.restore_table_manager(manager);
+                        }
+                        Self::delete_evicted_files(std::mem::take(
+                            &mut res.evicted_files_to_delete,
+                        ));
+                    }
+                    Err(_) => {
+                        table.on_persistence_failed();
+                    }
+                }
+            }
+            TableEvent::EvictedFilesToDelete { evicted_files } => {
+                Self::delete_evicted_files(evicted_files.files);
+            }
+            // CDC events, periodic events and flush results are dropped: nothing is applied to an
+            // errored table any more. Unapplied flush output stays in the table directory, which
+            // DROP deletes.
+            _ => {}
+        }
+        // A background task still running could write into the warehouse after the drop (which a
+        // re-created mirror with the same name would then load) or fail on files deleted under it.
+        errored_drop.pending && table.in_flight_background_tasks() == 0
+    }
+
+    fn request_errored_drop(
+        errored_drop: &mut ErroredDrop,
+        table_handler_event_sender: &Sender<TableEvent>,
+    ) {
+        if errored_drop.pending {
+            return;
+        }
+        errored_drop.pending = true;
+        let sender = table_handler_event_sender.clone();
+        let wait = errored_drop.background_task_wait;
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            let _ = sender.send(TableEvent::ErroredDropTimeout).await;
+        });
+    }
+
+    fn log_if_background_maintenance_stopped(
+        table_handler_state: &TableHandlerState,
+        table: &MooncakeTable,
+    ) {
+        if table_handler_state.consecutive_maintenance_failures
+            == table_handler_state::MAX_CONSECUTIVE_BACKGROUND_MAINTENANCE_FAILURES
+        {
+            error!(
+                table = table.mooncake_table_id(),
+                failures = table_handler_state.consecutive_maintenance_failures,
+                "background compaction and index merge stopped after repeated failures; explicit optimize requests still run them"
+            );
+        }
+    }
+
+    /// Best-effort deletion of evicted cache files in a detached task.
+    fn delete_evicted_files(files: Vec<String>) {
+        if files.is_empty() {
+            return;
+        }
+        tokio::task::spawn(async move {
+            if let Err(err) = io_utils::delete_local_files(&files).await {
+                error!(error = ?err, "failed to delete evicted cache files of errored table");
+            }
+        });
+    }
+
+    /// Best-effort cleanup of an errored table; always acknowledges the drop so users can
+    /// re-create the mirror. Failures are logged, except an iceberg drop failure, which would let a
+    /// re-created mirror load stale data and is therefore reported.
+    async fn drop_errored_table(table: &mut MooncakeTable, event_sync_sender: EventSyncSender) {
+        if let Err(e) = table.shutdown().await {
+            error!(error = ?e, table = table.mooncake_table_id(), "failed to release caches of errored table");
+        }
+        let mut dropped = table.drop_iceberg_table().await;
+        if let Err(e) = &dropped {
+            warn!(error = ?e, table = table.mooncake_table_id(), "failed to drop iceberg table of errored table; retrying once");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            dropped = table.drop_iceberg_table().await;
+        }
+        if let Err(e) = dropped {
+            error!(error = ?e, table = table.mooncake_table_id(), "failed to drop iceberg table of errored table");
+            let _ = event_sync_sender.drop_table_completion_tx.send(Err(e));
+            return;
+        }
+        if let Err(e) = table.drop_mooncake_table().await {
+            error!(error = ?e, table = table.mooncake_table_id(), "failed to delete local files of errored table");
+        }
+        let _ = event_sync_sender.drop_table_completion_tx.send(Ok(()));
     }
 
     async fn process_cdc_table_event(
@@ -861,17 +1175,29 @@ impl TableHandler {
             table_handler_state.initial_copy_buffered_events.push(event);
             return;
         }
-        // Don't update the lsn if the event is not processed yet.
-        table_handler_state.update_table_lsns(&event);
-
-        // Discard events that we have already processed.
-        if table_handler_state.should_discard_event(&event) && !event.is_recovery() {
+        if table_handler_state.skip_resent_event(&event) {
+            // Streamed rows of a replayed transaction were collected again; drop them.
+            if let TableEvent::Commit {
+                xact_id: Some(xact_id),
+                ..
+            } = event
+            {
+                if table.has_transaction_stream(xact_id) {
+                    table.abort_in_stream_batch(xact_id);
+                }
+            }
             return;
         }
 
-        if !event.is_recovery() {
-            table.push_wal_event(&event);
+        // Discard events that we have already processed (persisted, or in the initial copy). They
+        // must not move the table's LSNs either: an empty copy claims no commit LSN, and a dropped
+        // commit would otherwise become one that no snapshot ever reaches.
+        if table_handler_state.should_discard_event(&event) {
+            return;
         }
+
+        // Don't update the lsn if the event is not processed yet.
+        table_handler_state.update_table_lsns(&event);
 
         match event {
             TableEvent::Append { row, xact_id, .. } => {
@@ -926,15 +1252,8 @@ impl TableHandler {
                 )
                 .await;
             }
-            TableEvent::StreamAbort {
-                xact_id,
-                closes_incomplete_wal_transaction,
-                ..
-            } => {
-                // If we are closing a transaction that is part of the WAL recovery process, then we do not need to process it, but just push it in to the WAL.
-                if !closes_incomplete_wal_transaction {
-                    table.abort_in_stream_batch(xact_id);
-                }
+            TableEvent::StreamAbort { xact_id } => {
+                table.abort_in_stream_batch(xact_id);
             }
             TableEvent::CommitFlush { lsn, xact_id, .. } => {
                 Self::commit_and_attempt_flush(
@@ -969,6 +1288,28 @@ impl TableHandler {
         for event in buffered_events {
             Self::process_cdc_table_event(event, table, table_handler_state).await;
         }
+    }
+
+    /// A commit below the table's commit LSN belongs to a transaction re-sent after the table
+    /// applied it, which the replay floors should have skipped. Applying it could duplicate rows,
+    /// so the mirror is errored instead; returns whether it was.
+    fn error_if_commit_behind_table(
+        lsn: u64,
+        table_handler_state: &mut TableHandlerState,
+        table: &MooncakeTable,
+    ) -> bool {
+        let table_commit_lsn = table.get_commit_lsn_baseline();
+        if lsn >= table_commit_lsn {
+            return false;
+        }
+        Self::enter_errored(
+            table_handler_state,
+            table,
+            format!(
+                "a transaction committed at LSN {lsn} arrived after the mirror had applied changes up to LSN {table_commit_lsn}"
+            ),
+        );
+        true
     }
 
     async fn commit_and_attempt_flush(
@@ -1007,12 +1348,19 @@ impl TableHandler {
                         return;
                     }
                 }
+                if Self::error_if_commit_behind_table(lsn, table_handler_state, table) {
+                    table.abort_in_stream_batch(xact_id);
+                    return;
+                }
                 let event_id = uuid::Uuid::new_v4();
                 if let Err(e) = table.commit_transaction_stream(xact_id, lsn, event_id) {
                     error!(error = %e, "stream commit flush failed");
                 }
             }
             None => {
+                if Self::error_if_commit_behind_table(lsn, table_handler_state, table) {
+                    return;
+                }
                 table.commit(lsn);
                 if table.should_flush() || should_force_flush || force_flush_requested {
                     table_handler_state.last_unflushed_commit_lsn = None;
@@ -1026,6 +1374,18 @@ impl TableHandler {
     }
 }
 
+/// The flush LSN feeds the replication slot acknowledgement, so it only moves forward.
+fn advance_flush_lsn(flush_lsn_tx: &watch::Sender<u64>, lsn: u64) {
+    flush_lsn_tx.send_if_modified(|current| {
+        if lsn > *current {
+            *current = lsn;
+            true
+        } else {
+            false
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1034,6 +1394,15 @@ mod test_utils;
 
 #[cfg(test)]
 mod failure_tests;
+
+#[cfg(test)]
+mod cache_budget_tests;
+
+#[cfg(test)]
+mod mem_slice_bytes_tests;
+
+#[cfg(test)]
+mod force_snapshot_tests;
 
 #[cfg(test)]
 #[cfg(feature = "chaos-test")]
@@ -1053,3 +1422,76 @@ mod regression;
 
 #[cfg(feature = "profile-test")]
 pub mod profile_test;
+
+#[cfg(test)]
+mod errored_state_tests;
+
+#[cfg(test)]
+mod errored_drop_tests;
+
+#[cfg(test)]
+mod maintenance_failure_tests;
+
+#[cfg(test)]
+mod persistence_failure_tests;
+
+/// Serves a table whose event loop panicked: the table is errored, requests fail, DROP works.
+struct EventLoopPanicFallback {
+    dropper: TableDropper,
+    table_name: String,
+    drop_completion_tx: crate::event_sync::DropCompletionSender,
+    force_snapshot_completion_tx: watch::Sender<Option<crate::Result<u64>>>,
+    table_maintenance_completion_tx: tokio::sync::broadcast::Sender<crate::Result<()>>,
+    table_status_tx: watch::Sender<crate::event_sync::TableStatus>,
+}
+
+impl EventLoopPanicFallback {
+    async fn run(self, event_receiver: &mut Receiver<TableEvent>, panic_message: String) {
+        let reason = format!("internal error in table event loop: {panic_message}");
+        error!(
+            table = self.table_name,
+            reason, "mirror table entered the errored state; it must be dropped and re-created"
+        );
+        let message = crate::Error::errored_table_message(&self.table_name, &reason);
+        let _ = self
+            .table_status_tx
+            .send(crate::event_sync::TableStatus::Errored(message.clone()));
+        let _ = self
+            .force_snapshot_completion_tx
+            .send(Some(Err(crate::Error::table_errored(&message))));
+        let _ = self
+            .table_maintenance_completion_tx
+            .send(Err(crate::Error::table_errored(&message)));
+        while let Some(event) = event_receiver.recv().await {
+            match event {
+                TableEvent::DropTable => {
+                    let result = self
+                        .dropper
+                        .drop_all(ERRORED_DROP_BACKGROUND_TASK_WAIT)
+                        .await;
+                    if let Err(e) = &result {
+                        error!(error = ?e, table = self.table_name, "failed to drop errored table");
+                    }
+                    let _ = self.drop_completion_tx.send(result);
+                    return;
+                }
+                TableEvent::ForceSnapshot { .. } => {
+                    let _ = self
+                        .force_snapshot_completion_tx
+                        .send(Some(Err(crate::Error::table_errored(&message))));
+                }
+                TableEvent::ForceRegularIndexMerge
+                | TableEvent::ForceRegularDataCompaction
+                | TableEvent::ForceFullMaintenance => {
+                    let _ = self
+                        .table_maintenance_completion_tx
+                        .send(Err(crate::Error::table_errored(&message)));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod supervision_tests;

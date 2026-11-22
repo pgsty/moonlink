@@ -1,11 +1,9 @@
-use std::path::Path;
-
 use crate::{Error, Result};
 use moonlink::row::IdentityProp;
 use moonlink::MooncakeTableId;
 use moonlink::{
     AccessorConfig, DataCompactionConfig, FileIndexMergeConfig, IcebergTableConfig,
-    MooncakeTableConfig, MoonlinkTableConfig, StorageConfig, WalConfig,
+    MooncakeTableConfig, MoonlinkTableConfig, StorageConfig,
 };
 /// Configuration on table creation.
 use serde::{Deserialize, Serialize};
@@ -25,6 +23,10 @@ pub struct MooncakeConfig {
     /// Row identity of the table.
     #[serde(default)]
     pub row_identity: Option<IdentityProp>,
+    /// Approximate in-memory bytes per table (and per streamed transaction) at which buffered
+    /// rows are flushed to a data file; unset means the moonlink default.
+    #[serde(default)]
+    pub mem_slice_bytes: Option<usize>,
 }
 
 impl MooncakeConfig {
@@ -67,7 +69,16 @@ impl MooncakeConfig {
             DataCompactionConfig::enabled()
         };
 
+        if self.mem_slice_bytes == Some(0) {
+            return Err(Error::invalid_config(
+                "mem_slice_bytes must be greater than 0".to_string(),
+            ));
+        }
+
         let mut mooncake_table_config = MooncakeTableConfig::new(temp_files_dir);
+        if let Some(mem_slice_bytes) = self.mem_slice_bytes {
+            mooncake_table_config.mem_slice_bytes = mem_slice_bytes;
+        }
         mooncake_table_config.file_index_config = index_merge_config;
         mooncake_table_config.data_compaction_config = data_compaction_config;
         mooncake_table_config.append_only = self.append_only.unwrap();
@@ -88,11 +99,6 @@ pub struct TableConfig {
     #[serde(rename = "iceberg")]
     #[serde(default)]
     pub iceberg_config: Option<AccessorConfig>,
-
-    /// WAL storage config.
-    #[serde(rename = "wal")]
-    #[serde(default)]
-    pub wal_config: Option<AccessorConfig>,
 }
 
 impl TableConfig {
@@ -114,11 +120,6 @@ impl TableConfig {
                 atomic_write_dir: None,
             };
             config.iceberg_config = Some(AccessorConfig::new_with_storage_config(storage_config));
-        }
-        if config.wal_config.is_none() {
-            let storage_config =
-                WalConfig::default_storage_config_local(Path::new(default_table_directory));
-            config.wal_config = Some(AccessorConfig::new_with_storage_config(storage_config));
         }
 
         Ok(config)
@@ -149,10 +150,6 @@ impl TableConfig {
                     accessor_config: self.iceberg_config.clone().unwrap(),
                 },
             },
-            wal_table_config: WalConfig::new(
-                self.wal_config.unwrap(),
-                &mooncake_table_id.to_string(),
-            ),
         };
         Ok(config)
     }
@@ -169,18 +166,13 @@ mod tests {
                 .unwrap();
         let expected_table_config = TableConfig {
             mooncake_config: MooncakeConfig {
+                mem_slice_bytes: None,
                 skip_index_merge: false,
                 skip_data_compaction: false,
                 append_only: None,
                 row_identity: None,
             },
             iceberg_config: Some(AccessorConfig::new_with_storage_config(
-                moonlink::StorageConfig::FileSystem {
-                    root_directory: "/tmp/path".to_string(),
-                    atomic_write_dir: None,
-                },
-            )),
-            wal_config: Some(AccessorConfig::new_with_storage_config(
                 moonlink::StorageConfig::FileSystem {
                     root_directory: "/tmp/path".to_string(),
                     atomic_write_dir: None,
@@ -222,6 +214,7 @@ mod tests {
         .unwrap();
         let expected_table_config = TableConfig {
             mooncake_config: MooncakeConfig {
+                mem_slice_bytes: None,
                 skip_index_merge: true,
                 skip_data_compaction: false,
                 append_only: None,
@@ -231,86 +224,6 @@ mod tests {
                 moonlink::StorageConfig::FileSystem {
                     root_directory: "/tmp".to_string(),
                     atomic_write_dir: None,
-                },
-            )),
-            wal_config: Some(AccessorConfig::new_with_storage_config(
-                moonlink::StorageConfig::FileSystem {
-                    root_directory: "/tmp/wal".to_string(),
-                    atomic_write_dir: None,
-                },
-            )),
-        };
-        assert_eq!(expected_table_config, actual_table_config);
-    }
-
-    #[test]
-    #[cfg(feature = "storage-gcs")]
-    fn test_table_config_from_valid_json_with_gcs() {
-        let serialized = r#"
-            {
-                "mooncake": {
-                    "skip_index_merge": true
-                },
-                "iceberg": {
-                    "storage_config": {
-                        "gcs": {
-                            "project": "gcs-proj",
-                            "region": "us-west1",
-                            "bucket": "moonlink",
-                            "access_key_id": "access-key",
-                            "secret_access_key": "secret"
-                        }
-                    }
-                },
-                "wal": {
-                    "storage_config": {
-                        "gcs": {
-                            "project": "gcs-proj",
-                            "region": "us-west1",
-                            "bucket": "moonlink-wal",
-                            "access_key_id": "access-key-wal",
-                            "secret_access_key": "secret-wal"
-                        }
-                    }
-                }
-            }
-        "#;
-
-        // Deserialize and check.
-        let actual_table_config = TableConfig::from_json_or_default(
-            serialized,
-            /*default_table_directory=*/ "/tmp/path",
-        )
-        .unwrap();
-        let expected_table_config = TableConfig {
-            mooncake_config: MooncakeConfig {
-                skip_index_merge: true,
-                skip_data_compaction: false,
-                append_only: None,
-                row_identity: None,
-            },
-            iceberg_config: Some(AccessorConfig::new_with_storage_config(
-                moonlink::StorageConfig::Gcs {
-                    project: "gcs-proj".to_string(),
-                    region: "us-west1".to_string(),
-                    bucket: "moonlink".to_string(),
-                    access_key_id: "access-key".to_string(),
-                    secret_access_key: "secret".to_string(),
-                    endpoint: None,
-                    disable_auth: false,
-                    write_option: None,
-                },
-            )),
-            wal_config: Some(AccessorConfig::new_with_storage_config(
-                moonlink::StorageConfig::Gcs {
-                    project: "gcs-proj".to_string(),
-                    region: "us-west1".to_string(),
-                    bucket: "moonlink-wal".to_string(),
-                    access_key_id: "access-key-wal".to_string(),
-                    secret_access_key: "secret-wal".to_string(),
-                    endpoint: None,
-                    disable_auth: false,
-                    write_option: None,
                 },
             )),
         };
@@ -356,6 +269,7 @@ mod tests {
         .unwrap();
         let expected_table_config = TableConfig {
             mooncake_config: MooncakeConfig {
+                mem_slice_bytes: None,
                 skip_index_merge: true,
                 skip_data_compaction: false,
                 append_only: None,
@@ -370,17 +284,43 @@ mod tests {
                     endpoint: None,
                 },
             )),
-            wal_config: Some(AccessorConfig::new_with_storage_config(
-                moonlink::StorageConfig::S3 {
-                    region: "us-west1".to_string(),
-                    bucket: "moonlink-wal".to_string(),
-                    access_key_id: "access-key-wal".to_string(),
-                    secret_access_key: "secret-wal".to_string(),
-                    endpoint: None,
-                },
-            )),
         };
         assert_eq!(expected_table_config, actual_table_config);
+    }
+
+    /// `mooncake.mem_slice_bytes` from the user's table config reaches the mooncake table config.
+    #[test]
+    fn test_table_config_mem_slice_bytes() {
+        let table_config = TableConfig::from_json_or_default(
+            r#"{"mooncake": {"mem_slice_bytes": 4194304}}"#,
+            /*default_table_directory=*/ "/tmp/path",
+        )
+        .unwrap();
+        let mut mooncake_config = table_config.mooncake_config;
+        mooncake_config.append_only = Some(false);
+        mooncake_config.row_identity = Some(IdentityProp::FullRow);
+        let mooncake_table_config = mooncake_config
+            .clone()
+            .take_as_mooncake_table_config("/tmp/temp".to_string())
+            .unwrap();
+        assert_eq!(mooncake_table_config.mem_slice_bytes, 4194304);
+
+        // Unset keeps the moonlink default.
+        mooncake_config.mem_slice_bytes = None;
+        let mooncake_table_config = mooncake_config
+            .clone()
+            .take_as_mooncake_table_config("/tmp/temp".to_string())
+            .unwrap();
+        assert_eq!(
+            mooncake_table_config.mem_slice_bytes,
+            MooncakeTableConfig::default_mem_slice_bytes()
+        );
+
+        // Zero would flush after every row; reject it.
+        mooncake_config.mem_slice_bytes = Some(0);
+        assert!(mooncake_config
+            .take_as_mooncake_table_config("/tmp/temp".to_string())
+            .is_err());
     }
 
     #[test]
@@ -404,18 +344,13 @@ mod tests {
         .unwrap();
         let expected_table_config = TableConfig {
             mooncake_config: MooncakeConfig {
+                mem_slice_bytes: None,
                 skip_index_merge: true,
                 skip_data_compaction: true,
                 append_only: Some(true),
                 row_identity: Some(IdentityProp::None),
             },
             iceberg_config: Some(AccessorConfig::new_with_storage_config(
-                moonlink::StorageConfig::FileSystem {
-                    root_directory: "/tmp/path".to_string(),
-                    atomic_write_dir: None,
-                },
-            )),
-            wal_config: Some(AccessorConfig::new_with_storage_config(
                 moonlink::StorageConfig::FileSystem {
                     root_directory: "/tmp/path".to_string(),
                     atomic_write_dir: None,

@@ -2,7 +2,7 @@ use crate::error::Result;
 use moonlink::row::IdentityProp;
 use moonlink::{
     DataCompactionConfig, DiskSliceWriterConfig, FileIndexMergeConfig, IcebergPersistenceConfig,
-    IcebergTableConfig, MooncakeTableConfig, MoonlinkTableConfig, WalConfig,
+    IcebergTableConfig, MooncakeTableConfig, MoonlinkTableConfig,
 };
 /// This module contains util functions related to moonlink config.
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,10 @@ struct MooncakeTableConfigForPersistence {
     /// Number of batch records which decides when to flush records from MemSlice to disk.
     #[serde(default = "MooncakeTableConfig::default_mem_slice_size")]
     mem_slice_size: usize,
+
+    /// Approximate mem slice bytes which also trigger a flush.
+    #[serde(default = "MooncakeTableConfig::default_mem_slice_bytes")]
+    mem_slice_bytes: usize,
 
     /// Number of new deletion records which decides whether to create a new mooncake table snapshot.
     #[serde(default = "MooncakeTableConfig::default_snapshot_deletion_record_count")]
@@ -69,8 +73,6 @@ struct MoonlinkTableConfigForPersistence {
     mooncake_table_config: MooncakeTableConfigForPersistence,
     /// Iceberg table configuration.
     iceberg_table_config: IcebergTableConfig,
-    /// WAL configuration.
-    wal_config: WalConfig,
 }
 
 impl MoonlinkTableConfigForPersistence {
@@ -100,6 +102,7 @@ impl MoonlinkTableConfigForPersistence {
             append_only: self.mooncake_table_config.append_only,
             row_identity: self.mooncake_table_config.row_identity.clone(),
             mem_slice_size: self.mooncake_table_config.mem_slice_size,
+            mem_slice_bytes: self.mooncake_table_config.mem_slice_bytes,
             snapshot_deletion_record_count: self
                 .mooncake_table_config
                 .snapshot_deletion_record_count,
@@ -126,13 +129,12 @@ pub(crate) fn parse_moonlink_table_config(
 ) -> Result<serde_json::Value> {
     // Serialize mooncake table config.
     let iceberg_table_config = moonlink_table_config.iceberg_table_config;
-    let wal_config = moonlink_table_config.wal_table_config;
     let mooncake_config = moonlink_table_config.mooncake_table_config;
     let persisted = MoonlinkTableConfigForPersistence {
         iceberg_table_config,
-        wal_config,
         mooncake_table_config: MooncakeTableConfigForPersistence {
             mem_slice_size: mooncake_config.mem_slice_size,
+            mem_slice_bytes: mooncake_config.mem_slice_bytes,
             snapshot_deletion_record_count: mooncake_config.snapshot_deletion_record_count,
             batch_size: mooncake_config.batch_size,
             disk_slice_parquet_file_size: mooncake_config
@@ -159,7 +161,6 @@ pub(crate) fn deserialize_moonlink_table_config(
 
     let moonlink_table_config = MoonlinkTableConfig {
         iceberg_table_config: parsed.iceberg_table_config,
-        wal_table_config: parsed.wal_config,
         mooncake_table_config,
     };
 
@@ -177,7 +178,6 @@ mod tests {
         let old_moonlink_table_config = MoonlinkTableConfig {
             iceberg_table_config: IcebergTableConfig::default(),
             mooncake_table_config: MooncakeTableConfig::default(),
-            wal_table_config: WalConfig::default(),
         };
         let serialized_persisted_config =
             parse_moonlink_table_config(old_moonlink_table_config.clone()).unwrap();
@@ -190,6 +190,53 @@ mod tests {
         assert_eq!(
             new_moonlink_table_config.iceberg_table_config,
             old_moonlink_table_config.iceberg_table_config
+        );
+    }
+
+    // Configs persisted by moonlink versions with a WAL carry a `wal_config` entry; it must be ignored.
+    #[test]
+    fn test_deserialize_config_persisted_with_legacy_wal_config() {
+        let moonlink_table_config = MoonlinkTableConfig {
+            iceberg_table_config: IcebergTableConfig::default(),
+            mooncake_table_config: MooncakeTableConfig::default(),
+        };
+        let mut persisted = parse_moonlink_table_config(moonlink_table_config.clone()).unwrap();
+        let legacy_accessor_config =
+            serde_json::to_value(moonlink::AccessorConfig::new_with_storage_config(
+                moonlink::StorageConfig::FileSystem {
+                    root_directory: "/tmp/legacy_wal".to_string(),
+                    atomic_write_dir: None,
+                },
+            ))
+            .unwrap();
+        persisted.as_object_mut().unwrap().insert(
+            "wal_config".to_string(),
+            json!({
+                "accessor_config": legacy_accessor_config,
+                "mooncake_table_id": "db.schema.table",
+            }),
+        );
+
+        let deserialized = deserialize_moonlink_table_config(persisted).unwrap();
+        assert_eq!(deserialized, moonlink_table_config);
+    }
+
+    /// A configured mem slice byte budget survives persistence (it is reloaded at restart).
+    #[test]
+    fn test_mem_slice_bytes_persisted() {
+        let mooncake_table_config = MooncakeTableConfig {
+            mem_slice_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        };
+        let moonlink_table_config = MoonlinkTableConfig {
+            iceberg_table_config: IcebergTableConfig::default(),
+            mooncake_table_config,
+        };
+        let persisted = parse_moonlink_table_config(moonlink_table_config).unwrap();
+        let restored = deserialize_moonlink_table_config(persisted).unwrap();
+        assert_eq!(
+            restored.mooncake_table_config.mem_slice_bytes,
+            4 * 1024 * 1024
         );
     }
 
@@ -215,6 +262,7 @@ mod tests {
         let expected_persisted_config = MooncakeTableConfigForPersistence {
             // Mooncake table config.
             mem_slice_size: MooncakeTableConfig::default_mem_slice_size(),
+            mem_slice_bytes: MooncakeTableConfig::default_mem_slice_bytes(),
             snapshot_deletion_record_count:
                 MooncakeTableConfig::default_snapshot_deletion_record_count(),
             batch_size: MooncakeTableConfig::default_batch_size(),
@@ -242,5 +290,41 @@ mod tests {
             row_identity: IdentityProp::None,
         };
         assert_eq!(actual_persisted_config, expected_persisted_config);
+    }
+
+    /// A table config persisted by moonlink 0.2 (c1a99ef, the version pg_mooncake 0.2 ships),
+    /// including its `wal_config`, must still load after upgrading.
+    #[test]
+    fn test_deserialize_config_persisted_by_v0_2() {
+        const V0_2_PERSISTED_CONFIG: &str = r#"{"iceberg_table_config":{"data_accessor_config":{"chaos_config":null,"retry_config":{"delay_factor":1.5,"max_count":5,"max_delay":{"nanos":0,"secs":5},"min_delay":{"nanos":100000000,"secs":0}},"storage_config":{"fs":{"atomic_write_dir":null,"root_directory":"/pgdata/pg_mooncake"}},"throttle_config":null,"timeout_config":{"timeout":{"nanos":0,"secs":60}}},"metadata_accessor_config":{"file":{"accessor_config":{"chaos_config":null,"retry_config":{"delay_factor":1.5,"max_count":5,"max_delay":{"nanos":0,"secs":5},"min_delay":{"nanos":100000000,"secs":0}},"storage_config":{"fs":{"atomic_write_dir":null,"root_directory":"/pgdata/pg_mooncake"}},"throttle_config":null,"timeout_config":{"timeout":{"nanos":0,"secs":60}}}}},"namespace":["mooncake"],"table_name":"public.orders_mc"},"mooncake_table_config":{"append_only":false,"batch_size":128,"data_compaction_config":{"data_file_deletion_percentage":50,"data_file_final_size":1024,"max_data_file_to_compact":8,"min_data_file_to_compact":4},"disk_slice_parquet_file_size":2097152,"file_index_config":{"index_block_final_size":1024,"max_file_indices_to_merge":8,"min_file_indices_to_merge":4},"mem_slice_size":1024,"persistence_config":{"new_committed_deletion_log":1000,"new_compacted_data_file_count":1,"new_data_file_count":1,"old_compacted_data_file_count":1,"old_merged_file_indices_count":1},"row_identity":{"Keys":[0]},"snapshot_deletion_record_count":1000},"wal_config":{"accessor_config":{"chaos_config":null,"retry_config":{"delay_factor":1.5,"max_count":5,"max_delay":{"nanos":0,"secs":5},"min_delay":{"nanos":100000000,"secs":0}},"storage_config":{"fs":{"atomic_write_dir":null,"root_directory":"/pgdata/pg_mooncake"}},"throttle_config":null,"timeout_config":{"timeout":{"nanos":0,"secs":60}}},"mooncake_table_id":"mooncake.public.orders_mc"}}"#;
+        let config =
+            deserialize_moonlink_table_config(serde_json::from_str(V0_2_PERSISTED_CONFIG).unwrap())
+                .unwrap();
+
+        let storage = moonlink::AccessorConfig::new_with_storage_config(
+            moonlink::StorageConfig::FileSystem {
+                root_directory: "/pgdata/pg_mooncake".to_string(),
+                atomic_write_dir: None,
+            },
+        );
+        assert_eq!(
+            config.iceberg_table_config.namespace,
+            vec!["mooncake".to_string()]
+        );
+        assert_eq!(config.iceberg_table_config.table_name, "public.orders_mc");
+        assert_eq!(config.iceberg_table_config.data_accessor_config, storage);
+        assert_eq!(
+            config.iceberg_table_config.metadata_accessor_config,
+            moonlink::IcebergCatalogConfig::File {
+                accessor_config: storage
+            }
+        );
+        let mooncake = &config.mooncake_table_config;
+        assert!(!mooncake.append_only);
+        assert_eq!(mooncake.row_identity, IdentityProp::Keys(vec![0]));
+        assert_eq!(mooncake.batch_size, 128);
+        assert_eq!(mooncake.disk_slice_writer_config.parquet_file_size, 2097152);
+        assert_eq!(mooncake.data_compaction_config.min_data_file_to_compact, 4);
+        assert_eq!(mooncake.file_index_config.index_block_final_size, 1024);
     }
 }

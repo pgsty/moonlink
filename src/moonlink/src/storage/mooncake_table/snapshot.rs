@@ -88,6 +88,23 @@ pub(crate) struct SnapshotTableState {
 
     /// Batch ID counter for non-streaming operations
     pub(super) non_streaming_batch_id_counter: Arc<BatchIdCounter>,
+
+    /// Mooncake snapshot sequence, incremented at the end of every snapshot update; shared with
+    /// the owning table (and its garbage collection) through an `Arc`.
+    pub(crate) snapshot_seq: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Whether data compaction already logged groups it can never compact.
+    pub(super) logged_uncompactable_groups: std::sync::atomic::AtomicBool,
+
+    /// Garbage collection of the owning table's iceberg files, if enabled.
+    pub(crate) gc_context: Option<Arc<crate::storage::table::iceberg::gc::IcebergGcContext>>,
+}
+
+/// A committed deletion that found no row to delete.
+#[derive(Debug)]
+struct UnmatchedDeletion {
+    lookup_key: u64,
+    lsn: u64,
 }
 
 #[derive(Clone)]
@@ -106,6 +123,9 @@ pub struct MooncakeSnapshotOutput {
     pub(crate) evicted_data_files_to_delete: Vec<String>,
     /// Optional mooncake snapshot dump.
     pub(crate) current_snapshot: Option<Snapshot>,
+    /// Set when committed deletions found no row to delete: the mirror no longer matches its
+    /// source and must be errored. Nothing of such a snapshot is persisted.
+    pub(crate) unmatched_deletions: Option<String>,
 }
 
 impl std::fmt::Debug for MooncakeSnapshotOutput {
@@ -127,6 +147,7 @@ impl std::fmt::Debug for MooncakeSnapshotOutput {
                 &self.evicted_data_files_to_delete.len(),
             )
             .field("current_snapshot", &self.current_snapshot)
+            .field("unmatched_deletions", &self.unmatched_deletions)
             .finish()
     }
 }
@@ -167,6 +188,9 @@ impl SnapshotTableState {
 
         let table_config = metadata.config.clone();
         Ok(Self {
+            snapshot_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            logged_uncompactable_groups: std::sync::atomic::AtomicBool::new(false),
+            gc_context: None,
             iceberg_warehouse_location,
             mooncake_table_metadata: metadata.clone(),
             current_snapshot,
@@ -552,7 +576,7 @@ impl SnapshotTableState {
 
         // After data compaction and index merge changes have been applied to snapshot, processed deletion record will point to the new record location.
         self.rows = take(&mut task.new_rows);
-        self.process_deletion_log(&mut task).await;
+        let unmatched_deletions = self.process_deletion_log(&mut task).await;
 
         // Assert and update flush LSN.
         if let Some(new_flush_lsn) = task.new_flush_lsn {
@@ -615,6 +639,7 @@ impl SnapshotTableState {
         let flush_lsn = self.current_snapshot.flush_lsn.unwrap_or(0);
         let largest_flush_lsn = self.current_snapshot.largest_flush_lsn.unwrap_or(0);
         if opt.iceberg_snapshot_option != IcebergSnapshotOption::Skip
+            && unmatched_deletions.is_none()
             && (force_empty_persistence_payload || flush_by_table_write)
             && flush_lsn < task.min_ongoing_flush_lsn
             && flush_lsn == largest_flush_lsn
@@ -650,6 +675,15 @@ impl SnapshotTableState {
             self.assert_current_snapshot_consistent().await;
         }
 
+        // Published after every state change of this update (readers hold the read lock).
+        let seq = self
+            .snapshot_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if let (Some(gc_context), Some(commit)) = (&self.gc_context, task.applied_iceberg_commit) {
+            gc_context.mark_applied(commit, seq);
+        }
+
         MooncakeSnapshotOutput {
             uuid: opt.uuid,
             commit_lsn: self.current_snapshot.snapshot_version,
@@ -658,6 +692,7 @@ impl SnapshotTableState {
             file_indices_merge_payload,
             evicted_data_files_to_delete,
             current_snapshot: opt.dump_snapshot.then(|| self.current_snapshot.clone()),
+            unmatched_deletions,
         }
     }
 
@@ -815,6 +850,7 @@ impl SnapshotTableState {
         file_id_to_lsn: &HashMap<FileId, u64>,
         batch_id_to_lsn: &HashMap<u64, u64>,
         delete_if_exists: bool,
+        unmatched: &mut Vec<UnmatchedDeletion>,
     ) -> Vec<ProcessedDeletionRecord> {
         let mut candidates: Vec<RecordLocation> = index_lookup_result
             .into_iter()
@@ -833,17 +869,14 @@ impl SnapshotTableState {
             let mut processed_deletions = Vec::new();
             assert_eq!(deletions.len(), 1);
             let deletion = deletions.first().unwrap();
-            if deletion.row_identity.is_none() {
+            if deletion.row_identity.is_none() && deletion.identity_fingerprint.is_none() {
                 let candidate = candidates.pop();
                 if let Some(candidate) = candidate {
                     processed_deletions.push(Self::build_processed_deletion(deletion, candidate));
                 }
             } else {
                 for loc in &candidates {
-                    if self
-                        .matches_identity(loc, deletion.row_identity.as_ref().unwrap())
-                        .await
-                    {
+                    if self.deletion_matches(loc, deletion).await {
                         processed_deletions
                             .push(Self::build_processed_deletion(deletion, loc.clone()));
                         break;
@@ -861,30 +894,32 @@ impl SnapshotTableState {
                 .zip(deletions.iter())
                 .map(|(loc, deletion)| Self::build_processed_deletion(deletion, loc))
                 .collect(),
-            Ordering::Less => {
-                panic!("find less than expected candidates to deletions {deletions:?}, candidates: {candidates:?}, batch_id_to_lsn: {batch_id_to_lsn:?}, file_id_to_lsn: {file_id_to_lsn:?}")
-            }
-            Ordering::Greater => {
+            // More rows than deletions: pick each deletion's row by its identity. A deletion left
+            // without a row (fewer rows than deletions) means a row the source deletes is missing
+            // here. Re-sent transactions never get this far (the replay floors skip them, and a
+            // streamed one holds its deletions until its commit), so the mirror has diverged:
+            // delete what matches and report the rest.
+            Ordering::Less | Ordering::Greater => {
                 let mut processed_deletions = Vec::new();
-                // multiple candidates → disambiguate via full row identity comparison.
                 for deletion in deletions.iter() {
-                    assert!(deletion.row_identity.is_some(), "deletion: {deletion:?}, candidates: {candidates:?}, batch_id_to_lsn: {batch_id_to_lsn:?}, file_id_to_lsn: {file_id_to_lsn:?}");
-                    let identity = deletion
-                        .row_identity
-                        .as_ref()
-                        .expect("row_identity required when multiple matches");
+                    if candidates.len() > deletions.len() {
+                        assert!(deletion.row_identity.is_some() || deletion.identity_fingerprint.is_some(), "deletion: {deletion:?}, candidates: {candidates:?}, batch_id_to_lsn: {batch_id_to_lsn:?}, file_id_to_lsn: {file_id_to_lsn:?}");
+                    }
                     let mut target_position: Option<RecordLocation> = None;
                     for (idx, loc) in candidates.iter().enumerate() {
-                        let matches = self.matches_identity(loc, identity).await;
-                        if matches {
+                        if self.deletion_matches(loc, deletion).await {
                             target_position = Some(candidates.swap_remove(idx));
                             break;
                         }
                     }
-                    processed_deletions.push(Self::build_processed_deletion(
-                        deletion,
-                        target_position.unwrap(),
-                    ));
+                    match target_position {
+                        Some(target) => processed_deletions
+                            .push(Self::build_processed_deletion(deletion, target)),
+                        None => unmatched.push(UnmatchedDeletion {
+                            lookup_key: deletion.lookup_key,
+                            lsn: deletion.lsn,
+                        }),
+                    }
                 }
                 processed_deletions
             }
@@ -936,6 +971,39 @@ impl SnapshotTableState {
             RecordLocation::DiskFile(file_id, _) => {
                 file_id_to_lsn.get(file_id).is_none()
                     || file_id_to_lsn.get(file_id).unwrap() <= &lsn
+            }
+        }
+    }
+
+    /// Whether the row at `loc` is the one `deletion` deletes, among rows with its lookup key.
+    async fn deletion_matches(&self, loc: &RecordLocation, deletion: &RawDeletionRecord) -> bool {
+        if let Some(identity) = &deletion.row_identity {
+            return self.matches_identity(loc, identity).await;
+        }
+        match deletion.identity_fingerprint {
+            Some(fingerprint) => self.read_row(loc).await.full_row_fingerprint() == fingerprint,
+            None => true,
+        }
+    }
+
+    /// The row at `loc`.
+    async fn read_row(&self, loc: &RecordLocation) -> MoonlinkRow {
+        match loc {
+            RecordLocation::MemoryBatch(batch_id, row_id) => {
+                let batch = self.batches.get(batch_id).expect("missing batch");
+                let data = batch.data.as_ref().expect("batch missing data");
+                MoonlinkRow::from_record_batch(&data.slice(*row_id, 1))
+                    .expect("a batch moonlink wrote converts back to rows")
+                    .pop()
+                    .unwrap()
+            }
+            RecordLocation::DiskFile(file_id, row_id) => {
+                let (file, _) = self
+                    .current_snapshot
+                    .disk_files
+                    .get_key_value(file_id)
+                    .expect("missing disk file");
+                MoonlinkRow::read_from_parquet_at_offset(file.file_path(), *row_id).await
             }
         }
     }
@@ -997,9 +1065,22 @@ impl SnapshotTableState {
         self.committed_deletion_log.push(deletion);
     }
 
-    async fn process_deletion_log(&mut self, task: &mut SnapshotTask) {
+    /// Returns why the mirror diverged, if committed deletions found no row to delete.
+    async fn process_deletion_log(&mut self, task: &mut SnapshotTask) -> Option<String> {
         self.advance_pending_deletions(task);
-        self.apply_new_deletions(task).await;
+        let unmatched = self.apply_new_deletions(task).await;
+        let first = unmatched.first()?;
+        tracing::error!(
+            count = unmatched.len(),
+            first = ?first,
+            "deletions found no row to delete"
+        );
+        Some(format!(
+            "{} deleted row(s) were not found in the mirror (the first, with lookup key {}, deleted at LSN {})",
+            unmatched.len(),
+            first.lookup_key,
+            first.lsn
+        ))
     }
 
     /// Update, commit, or re-queue previously seen deletions.
@@ -1034,7 +1115,8 @@ impl SnapshotTableState {
 
     /// Convert raw deletions discovered by the snapshot task and either commit
     /// them or defer until their LSN becomes visible.
-    async fn apply_new_deletions(&mut self, task: &mut SnapshotTask) {
+    async fn apply_new_deletions(&mut self, task: &mut SnapshotTask) -> Vec<UnmatchedDeletion> {
+        let mut unmatched = Vec::new();
         let mut new_deletions = take(&mut task.new_deletions);
         let mut already_processed = Vec::new();
         new_deletions.retain(|deletion| {
@@ -1049,7 +1131,7 @@ impl SnapshotTableState {
         new_deletions
             .sort_unstable_by(|a, b| a.lookup_key.cmp(&b.lookup_key).then(a.lsn.cmp(&b.lsn)));
         if new_deletions.is_empty() {
-            return;
+            return unmatched;
         }
         // moonlink don't support mix delete_if_exists and not delete_if_exists for now.
         //
@@ -1099,9 +1181,11 @@ impl SnapshotTableState {
                     &task.new_disk_file_lsn_map,
                     &task.flushing_batch_lsn_map,
                     delete_if_exists,
+                    &mut unmatched,
                 )
                 .await;
             self.add_processed_deletion(processed_deletions, task.commit_lsn_baseline);
         }
+        unmatched
     }
 }

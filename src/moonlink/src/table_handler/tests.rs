@@ -6,6 +6,7 @@ use tokio::sync::watch;
 
 use super::test_utils::*;
 use super::TableEvent;
+use super::TableHandler;
 use crate::row::IdentityProp;
 use crate::row::{MoonlinkRow, RowValue};
 use crate::storage::compaction::compaction_config::DataCompactionConfig;
@@ -18,14 +19,11 @@ use crate::storage::mooncake_table::TableMetadata as MooncakeTableMetadata;
 use crate::storage::mooncake_table_config::DiskSliceWriterConfig;
 use crate::storage::mooncake_table_config::IcebergPersistenceConfig;
 use crate::storage::mooncake_table_config::MooncakeTableConfig;
-use crate::storage::wal::test_utils::WAL_TEST_TABLE_ID;
-use crate::storage::wal::WalManager;
 use crate::storage::MockTableManager;
 use crate::storage::MooncakeTable;
 use crate::storage::TableManager;
 use crate::table_handler::table_handler_state::TableHandlerState;
 use crate::TableEventManager;
-use crate::WalConfig;
 
 use std::sync::Arc;
 
@@ -70,6 +68,7 @@ async fn test_table_handler_flush() {
 async fn test_append_with_small_disk_slice() {
     let temp_dir = tempdir().unwrap();
     let mooncake_table_config = MooncakeTableConfig {
+        mem_slice_bytes: usize::MAX,
         append_only: false,
         row_identity: IdentityProp::FullRow,
         batch_size: 1, // One mem slice only contains one row.
@@ -631,6 +630,7 @@ async fn test_iceberg_snapshot_creation_for_batch_write() {
     // Set mooncake and iceberg flush and snapshot threshold to huge value, to verify force flush and force snapshot works as expected.
     let temp_dir = tempdir().unwrap();
     let mooncake_table_config = MooncakeTableConfig {
+        mem_slice_bytes: usize::MAX,
         append_only: false,
         row_identity: IdentityProp::Keys(vec![0]),
         batch_size: MooncakeTableConfig::DEFAULT_BATCH_SIZE,
@@ -841,6 +841,7 @@ async fn test_iceberg_snapshot_creation_for_streaming_write() {
     // Set mooncake and iceberg flush and snapshot threshold to huge value, to verify force flush and force snapshot works as expected.
     let temp_dir = tempdir().unwrap();
     let mooncake_table_config = MooncakeTableConfig {
+        mem_slice_bytes: usize::MAX,
         append_only: false,
         row_identity: IdentityProp::Keys(vec![0]),
         batch_size: MooncakeTableConfig::DEFAULT_BATCH_SIZE,
@@ -1076,66 +1077,13 @@ async fn test_empty_table_snapshot_creation() {
     }
 }
 
-/// A database-wide replication position can advance without a new commit to this table.
-#[tokio::test]
-async fn test_force_snapshot_after_unrelated_commit() {
-    let temp_dir = tempdir().unwrap();
-    let mut config = MooncakeTableConfig::new(temp_dir.path().to_str().unwrap().to_string());
-    config.row_identity = IdentityProp::Keys(vec![0]);
-    config.persistence_config.new_data_file_count = 1000;
-    config.persistence_config.new_committed_deletion_log = 1000;
-    let mut env = TestEnvironment::new(temp_dir, config.clone()).await;
-    env.append_row(1, "John", 30, 0, None).await;
-    env.commit(1).await;
-    env.set_readable_lsn_with_cap(1, 100);
-    env.verify_snapshot(100, &[1]).await;
-
-    let rx = env.table_event_manager.initiate_snapshot(100).await;
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        TableEventManager::synchronize_force_snapshot_request(rx, 100),
-    )
-    .await
-    .expect("snapshot must persist the older table commit")
-    .unwrap();
-
-    let mut manager = env.create_iceberg_table_manager(config).await;
-    let (_, snapshot) = manager.load_snapshot_from_table().await.unwrap();
-    assert_eq!(snapshot.disk_files.len(), 1);
-    env.shutdown().await;
-}
-
-/// Replication can catch up after an already persisted table's snapshot request.
-#[tokio::test]
-async fn test_force_snapshot_waits_for_unrelated_commit() {
-    let mut env = TestEnvironment::default().await;
-    env.append_row(1, "John", 30, 0, None).await;
-    env.commit(1).await;
-    env.set_readable_lsn(1);
-    env.flush_table_and_sync(1, None).await;
-
-    let rx = env.table_event_manager.initiate_snapshot(100).await;
-    let wait = TableEventManager::synchronize_force_snapshot_request(rx, 100);
-    tokio::pin!(wait);
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(600), &mut wait)
-            .await
-            .is_err()
-    );
-    env.set_readable_lsn_with_cap(1, 100);
-    tokio::time::timeout(std::time::Duration::from_secs(5), &mut wait)
-        .await
-        .expect("snapshot must observe replication progress without a table write")
-        .unwrap();
-    env.shutdown().await;
-}
-
 /// Testing scenario: request iceberg snapshot with multiple LSNs.
 #[tokio::test]
 async fn test_multiple_snapshot_requests() {
     // Set mooncake and iceberg flush and snapshot threshold to huge value, to verify force flush and force snapshot works as expected.
     let temp_dir = tempdir().unwrap();
     let mooncake_table_config = MooncakeTableConfig {
+        mem_slice_bytes: usize::MAX,
         append_only: false,
         row_identity: IdentityProp::Keys(vec![0]),
         batch_size: MooncakeTableConfig::DEFAULT_BATCH_SIZE,
@@ -1356,7 +1304,6 @@ async fn test_initial_copy_basic() {
             row: create_row(1, "Alice", 30),
             xact_id: None,
             lsn: 5,
-            is_recovery: false,
         })
         .await
         .expect("send copied row");
@@ -1497,7 +1444,7 @@ async fn test_index_merge_with_sufficient_file_indices() {
 
     // Add another file and trigger a new force index merge.
     env.append_row(
-        /*id=*/ 4, /*name=*/ "Cat", /*age=*/ 40, /*lsn=*/ 5,
+        /*id=*/ 4, /*name=*/ "Cat", /*age=*/ 40, /*lsn=*/ 25,
         /*xact_id=*/ None,
     )
     .await;
@@ -1574,7 +1521,7 @@ async fn test_data_compaction_with_sufficient_data_files() {
 
     // Add another file and trigger a new force data compaction.
     env.append_row(
-        /*id=*/ 4, /*name=*/ "Cat", /*age=*/ 40, /*lsn=*/ 5,
+        /*id=*/ 4, /*name=*/ "Cat", /*age=*/ 40, /*lsn=*/ 25,
         /*xact_id=*/ None,
     )
     .await;
@@ -1608,6 +1555,7 @@ async fn test_full_maintenance_with_sufficient_data_files() {
     let temp_dir = tempdir().unwrap();
     // Setup mooncake config, which won't trigger any data compaction or index merge, if not full table maintenance.
     let mooncake_table_config = MooncakeTableConfig {
+        mem_slice_bytes: usize::MAX,
         append_only: false,
         row_identity: IdentityProp::Keys(vec![0]),
         data_compaction_config: DataCompactionConfig {
@@ -1669,7 +1617,7 @@ async fn test_full_maintenance_with_sufficient_data_files() {
 
     // Add another file and trigger a new force full compaction.
     env.append_row(
-        /*id=*/ 4, /*name=*/ "Cat", /*age=*/ 40, /*lsn=*/ 5,
+        /*id=*/ 4, /*name=*/ "Cat", /*age=*/ 40, /*lsn=*/ 25,
         /*xact_id=*/ None,
     )
     .await;
@@ -1727,16 +1675,17 @@ async fn test_discard_duplicate_writes() {
                 Ok((/*next_file_id=*/ 0, mock_mooncake_snapshot_copy))
             })
         });
-
-    let wal_config = WalConfig::default_wal_config_local(WAL_TEST_TABLE_ID, temp_dir.path());
-    let wal_manager = WalManager::new(&wal_config);
+    // The periodic mooncake snapshot can start an iceberg persistence when the test runs slowly;
+    // keep it in flight instead of failing the table on an unexpected mock call.
+    mock_table_manager
+        .expect_sync_snapshot()
+        .returning(|_, _| Box::pin(std::future::pending()));
 
     let mut mooncake_table = MooncakeTable::new_with_table_manager(
         mooncake_table_metadata,
         Box::new(mock_table_manager),
         create_test_object_storage_cache(&temp_dir),
         FileSystemAccessor::default_for_test(&temp_dir),
-        wal_manager,
     )
     .await
     .unwrap();
@@ -1787,306 +1736,380 @@ async fn test_discard_duplicate_writes() {
     env.verify_snapshot(40, &[30, 40]).await;
 }
 
-/// --- Test for WAL events ---
-#[tokio::test]
-async fn test_wal_persists_events() {
+/// Test util: a table handler for a table recovered from a persisted snapshot at `persisted_lsn`.
+async fn create_env_recovered_at(persisted_lsn: u64) -> TestEnvironment {
     let temp_dir = tempdir().unwrap();
-    let mut env = TestEnvironment::new(temp_dir, MooncakeTableConfig::default()).await;
-
-    let mut expected_events = Vec::new();
-
-    // we can't be sure of these events to be persisted because they will go into the iceberg snapshot
-    env.append_row(1, "John", 30, 1, None).await;
-    env.flush_table(1).await;
-
-    // this event will definitely be persisted in the WAL because it's not yet in the iceberg snapshot
-    expected_events.push(env.append_row(2, "Jane", 20, 0, Some(100)).await);
-
-    // take snapshot
-    let force_snapshot_completion_rx = env.table_event_manager.initiate_snapshot(1).await;
-    TableEventManager::synchronize_force_snapshot_request(
-        force_snapshot_completion_rx,
-        /*requested_lsn=*/ 1,
+    let mooncake_table_config =
+        MooncakeTableConfig::new(temp_dir.path().to_str().unwrap().to_string());
+    let mooncake_table_metadata = Arc::new(MooncakeTableMetadata {
+        mooncake_table_id: "table_name".to_string(),
+        table_id: 0,
+        schema: create_test_arrow_schema(),
+        config: mooncake_table_config.clone(),
+        path: temp_dir.path().to_path_buf(),
+    });
+    let mut recovered_snapshot = MooncakeSnapshot::new(mooncake_table_metadata.clone());
+    recovered_snapshot.flush_lsn = Some(persisted_lsn);
+    recovered_snapshot.snapshot_version = persisted_lsn;
+    let mut mock_table_manager = MockTableManager::new();
+    mock_table_manager
+        .expect_get_warehouse_location()
+        .times(1)
+        .returning(|| "".to_string());
+    mock_table_manager
+        .expect_load_snapshot_from_table()
+        .times(1)
+        .returning(move || {
+            let snapshot = recovered_snapshot.clone();
+            Box::pin(async move {
+                Ok((/*next_file_id=*/ 0, snapshot))
+            })
+        });
+    mock_table_manager
+        .expect_sync_snapshot()
+        .returning(|_, _| Box::pin(async { Ok(Default::default()) }));
+    let mooncake_table = MooncakeTable::new_with_table_manager(
+        mooncake_table_metadata,
+        Box::new(mock_table_manager),
+        create_test_object_storage_cache(&temp_dir),
+        FileSystemAccessor::default_for_test(&temp_dir),
     )
     .await
     .unwrap();
-
-    env.force_wal_persistence(1).await;
-
-    let wal_metadata = env.get_latest_wal_metadata().await.unwrap();
-
-    env.check_wal_events_from_metadata(&wal_metadata, &expected_events, &[])
-        .await;
+    TestEnvironment::new_with_mooncake_table(temp_dir, mooncake_table).await
 }
 
+/// Testing scenario: after a restart postgres re-sends transactions that are already persisted.
+/// Skipping them must not leave their LSNs behind as pending flush points; a later flush (here at
+/// a new streamed commit) would otherwise flush at an LSN below the recovered snapshot.
 #[tokio::test]
-async fn test_wal_truncates_events_after_snapshot() {
-    let temp_dir = tempdir().unwrap();
-    let mut env = TestEnvironment::new(temp_dir, MooncakeTableConfig::default()).await;
+async fn test_replayed_persisted_commit_does_not_regress_flush_lsn() {
+    let env = create_env_recovered_at(/*persisted_lsn=*/ 100).await;
 
-    let mut expected_events = Vec::new();
-    let mut not_expected_events = Vec::new();
+    // Re-sent, already persisted non-streamed transaction.
+    env.append_row(
+        /*id=*/ 1, /*name=*/ "John", /*age=*/ 30, /*lsn=*/ 20,
+        /*xact_id=*/ None,
+    )
+    .await;
+    env.commit(/*lsn=*/ 26).await;
 
-    // these events should not be persisted because they will go into the iceberg snapshot and be truncated
-    not_expected_events.push(env.append_row(1, "John", 30, 1, None).await);
-    env.flush_table(1).await;
-    // flush these events first so that they are persisted in the WAL, and this file is subsequently dropped by
-    // the iceberg snapshot
-    env.force_wal_persistence(1).await;
+    // New streamed transaction; its commit flushes preceding unflushed non-streamed writes.
+    env.append_row(
+        /*id=*/ 2,
+        /*name=*/ "Bob",
+        /*age=*/ 20,
+        /*lsn=*/ 0,
+        /*xact_id=*/ Some(7),
+    )
+    .await;
+    env.stream_commit(/*lsn=*/ 150, /*xact_id=*/ 7).await;
 
-    // take snapshot
-    let force_snapshot_completion_rx = env.table_event_manager.initiate_snapshot(1).await;
-    TableEventManager::synchronize_force_snapshot_request(
-        force_snapshot_completion_rx,
-        /*requested_lsn=*/ 1,
+    env.set_table_commit_lsn(150);
+    env.set_replication_lsn(150);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        env.verify_snapshot(150, &[2]),
     )
     .await
-    .unwrap();
-
-    // any vents after this should be in the WAL because iceberg snapshot cannot capture the uncommitted streaming xact
-    expected_events.push(env.append_row(2, "Jane", 20, 0, Some(100)).await);
-    expected_events.push(env.commit(2).await);
-
-    env.force_wal_persistence(2).await;
-
-    let wal_metadata = env.get_latest_wal_metadata().await.unwrap();
-
-    env.check_wal_events_from_metadata(&wal_metadata, &expected_events, &not_expected_events)
-        .await;
+    .expect("table handler stopped applying changes (flush LSN regressed below the snapshot)");
 }
 
+/// Testing scenario: after recovery from a snapshot persisted at a commit's end LSN, a transaction
+/// whose commit record starts exactly at that LSN (row events carry that start LSN) is not dropped.
 #[tokio::test]
-async fn test_wal_keeps_multiple_streaming_xacts() {
-    let temp_dir = tempdir().unwrap();
-    let mut env = TestEnvironment::new(temp_dir, MooncakeTableConfig::default()).await;
+async fn test_replay_keeps_transaction_starting_at_persisted_lsn() {
+    // The snapshot holds a transaction whose commit record spans [5, 10).
+    let env = create_env_recovered_at(/*persisted_lsn=*/ 10).await;
 
-    let mut expected_events = Vec::new();
-    let mut not_expected_events = Vec::new();
+    // Replayed persisted transaction: discarded.
+    env.append_row(
+        /*id=*/ 1, /*name=*/ "John", /*age=*/ 30, /*lsn=*/ 5,
+        /*xact_id=*/ None,
+    )
+    .await;
+    env.commit(/*lsn=*/ 10).await;
+    // Next transaction, whose commit record starts right at the persisted end LSN: kept.
+    env.append_row(
+        /*id=*/ 2, /*name=*/ "Bob", /*age=*/ 20, /*lsn=*/ 10,
+        /*xact_id=*/ None,
+    )
+    .await;
+    env.commit(/*lsn=*/ 20).await;
 
-    // these events should not be persisted because they will go into the iceberg snapshot
-    not_expected_events.push(env.append_row(1, "John", 30, 1, None).await);
-    env.flush_table(1).await;
-    not_expected_events.push(env.append_row(2, "Jane", 20, 0, Some(100)).await);
-    env.force_wal_persistence(1).await;
+    env.set_table_commit_lsn(20);
+    env.set_replication_lsn(20);
+    env.verify_snapshot(20, &[2]).await;
+}
 
-    not_expected_events.push(env.stream_commit(2, 100).await);
-    env.force_wal_persistence(2).await;
-
-    // any events after this should be in the WAL because iceberg snapshot cannot capture the uncommitted streaming xact
-    expected_events.push(env.append_row(3, "Jim", 30, 0, Some(101)).await);
-    expected_events.push(env.append_row(4, "Jill", 40, 3, None).await);
-    env.flush_table(3).await;
-    env.force_wal_persistence(3).await;
-
-    expected_events.push(env.append_row(5, "Jack", 50, 0, Some(102)).await);
-    expected_events.push(env.append_row(6, "Jill", 60, 5, None).await);
-    env.flush_table(5).await;
-
-    // take snapshot
-    let force_snapshot_completion_rx = env.table_event_manager.initiate_snapshot(5).await;
-    TableEventManager::synchronize_force_snapshot_request(
-        force_snapshot_completion_rx,
-        /*requested_lsn=*/ 5,
+/// Testing scenario: a streamed transaction committed at or below the table's replay floor is
+/// skipped, whichever floor applies: the recovered snapshot LSN of a restarted table, or the copy
+/// boundary of a freshly copied (here empty) one. The skipped commit does not move the table's LSNs:
+/// a snapshot forced at the floor completes at once (it would wait forever for a commit LSN no
+/// snapshot reaches). A later streamed transaction is applied.
+#[tokio::test]
+async fn test_streamed_commit_below_either_replay_floor_is_skipped() {
+    // Floor 1: recovered snapshot at LSN 100.
+    let mut env = create_env_recovered_at(/*persisted_lsn=*/ 100).await;
+    env.append_row(
+        /*id=*/ 1,
+        /*name=*/ "John",
+        /*age=*/ 30,
+        /*lsn=*/ 0,
+        /*xact_id=*/ Some(7),
+    )
+    .await;
+    env.stream_commit(/*lsn=*/ 90, /*xact_id=*/ 7).await;
+    env.set_replication_lsn(100);
+    let rx = env
+        .table_event_manager
+        .initiate_snapshot(/*lsn=*/ 100)
+        .await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 100),
     )
     .await
+    .expect("skipped streamed commit moved the table's LSNs")
     .unwrap();
+    env.append_row(
+        /*id=*/ 2,
+        /*name=*/ "Bob",
+        /*age=*/ 20,
+        /*lsn=*/ 0,
+        /*xact_id=*/ Some(8),
+    )
+    .await;
+    env.stream_commit(/*lsn=*/ 150, /*xact_id=*/ 8).await;
+    env.set_table_commit_lsn(150);
+    env.set_replication_lsn(150);
+    env.verify_snapshot(150, &[2]).await;
 
-    // we do one more round of wal persistence to make sure our WAL is most up to date
-    expected_events.push(env.commit(7).await);
-    env.force_wal_persistence(7).await;
-
-    // we should be keeping all WAL after the flush at LSN 2 because we have a streaming xact that is not committed
-    let wal_metadata = env.get_latest_wal_metadata().await.unwrap();
-
-    env.check_wal_events_from_metadata(&wal_metadata, &expected_events, &not_expected_events)
-        .await;
-}
-
-#[tokio::test]
-async fn test_wal_drop_table_removes_files() {
-    let temp_dir = tempdir().unwrap();
-    let mut env = TestEnvironment::new(temp_dir, MooncakeTableConfig::default()).await;
-
-    // append a row
-    env.append_row(1, "John", 30, 1, None).await;
-    env.flush_table(1).await;
-
-    env.force_wal_persistence(1).await;
-
-    // drop the table
-    env.drop_table().await.unwrap();
-
-    // check that the WAL files are deleted
-    // we at most have 2 files for 2 events, we check 0 and 1
-    let wal_filesystem_accessor = env.wal_filesystem_accessor.clone();
-    let file_names = [0, 1]
-        .iter()
-        .map(|i| {
-            WalManager::get_wal_file_path_for_mooncake_table(
-                *i,
-                env.wal_config.get_mooncake_table_id(),
-            )
-        })
-        .collect::<Vec<String>>();
-    for file_name in file_names {
-        assert!(!wal_filesystem_accessor
-            .object_exists(&file_name)
-            .await
-            .unwrap());
-    }
-}
-
-#[tokio::test]
-async fn test_wal_persistent_metadata_retrieval() {
-    let temp_dir = tempdir().unwrap();
-    let mut env = TestEnvironment::new(temp_dir, MooncakeTableConfig::default()).await;
-
-    let mut not_expected_events = Vec::new();
-
-    // Append some data and flush to create WAL files
-    not_expected_events.push(env.append_row(1, "Alice", 25, 1, None).await);
-    not_expected_events.push(env.append_row(2, "Bob", 30, 1, None).await);
-    env.flush_table(3).await;
-
-    // Lowest relevant file >= 0
-    env.force_wal_persistence(3).await;
-
-    // create more events
-    not_expected_events.push(env.append_row(3, "Charlie", 35, 4, None).await);
-    not_expected_events.push(env.append_row(4, "Diana", 40, 4, None).await);
-    env.flush_table(5).await;
-    // Lowest relevant file >= 1
-    env.force_wal_persistence(5).await;
-
-    // Create an iceberg snapshot
-    // None of the files before this are relevant, so we truncate them, so lowest relevant file >= 2
-    let rx = env.table_event_manager.initiate_snapshot(5).await;
-    TableEventManager::synchronize_force_snapshot_request(rx, 5)
+    // Floor 2: empty initial copy with boundary LSN 100.
+    let mut env = TestEnvironment::default().await;
+    let sender = env.handler.get_event_sender();
+    sender.send(TableEvent::StartInitialCopy).await.unwrap();
+    env.append_row(
+        /*id=*/ 1,
+        /*name=*/ "John",
+        /*age=*/ 30,
+        /*lsn=*/ 0,
+        /*xact_id=*/ Some(7),
+    )
+    .await;
+    env.stream_commit(/*lsn=*/ 90, /*xact_id=*/ 7).await;
+    sender
+        .send(TableEvent::FinishInitialCopy { start_lsn: 100 })
         .await
         .unwrap();
+    env.set_replication_lsn(100);
+    let rx = env
+        .table_event_manager
+        .initiate_snapshot(/*lsn=*/ 100)
+        .await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 100),
+    )
+    .await
+    .expect("skipped streamed commit moved the table's LSNs")
+    .unwrap();
+    env.append_row(
+        /*id=*/ 2,
+        /*name=*/ "Bob",
+        /*age=*/ 20,
+        /*lsn=*/ 0,
+        /*xact_id=*/ Some(8),
+    )
+    .await;
+    env.stream_commit(/*lsn=*/ 150, /*xact_id=*/ 8).await;
+    env.set_table_commit_lsn(150);
+    env.set_replication_lsn(150);
+    env.verify_snapshot(150, &[2]).await;
+}
 
-    // Flushing lowest relevant file >= 2
-    env.flush_table(6).await;
-    env.force_wal_persistence(6).await;
-
-    let wal_metadata = env
-        .get_latest_wal_metadata()
-        .await
-        .expect("No wal metadata found");
-    let highest_file_number = wal_metadata
-        .get_live_wal_files_tracker()
-        .first()
-        .expect("No live wal files found")
-        .file_number;
-
-    assert!(
-        highest_file_number >= 2,
-        "Expected valid file number, got {highest_file_number}"
+/// Testing scenario: transactions re-sent after a restart are skipped and counted; the first new
+/// event ends the run of skips.
+#[test]
+fn test_resent_events_are_skipped_and_counted() {
+    let (table_maintenance_completion_tx, _) = broadcast::channel(64usize);
+    let (force_snapshot_completion_tx, _) = watch::channel(None);
+    let mut state = TableHandlerState::new(
+        table_maintenance_completion_tx,
+        force_snapshot_completion_tx,
+        /*initial_persistence_lsn=*/ Some(100),
+        /*persistence_snapshot_lsn=*/ Some(100),
     );
+    let append = |lsn| TableEvent::Append {
+        row: MoonlinkRow::new(vec![RowValue::Int32(1)]),
+        xact_id: None,
+        lsn,
+    };
+    let commit = |lsn| TableEvent::Commit { lsn, xact_id: None };
 
-    env.check_wal_events_from_metadata(&wal_metadata, &[], &not_expected_events)
-        .await;
+    for (row_lsn, commit_lsn) in [(20, 26), (40, 60), (90, 100)] {
+        assert!(state.skip_resent_event(&append(row_lsn)));
+        assert!(state.skip_resent_event(&commit(commit_lsn)));
+    }
+    assert_eq!(state.skipped_resent_events, 6);
+    assert_eq!(state.skipped_resent_commits, 3);
 
-    env.check_wal_metadata_invariants(&wal_metadata, Some(5), vec![], vec![])
-        .await;
+    // A new transaction, whose commit record starts at the persisted LSN, is applied.
+    assert!(!state.skip_resent_event(&append(100)));
+    assert!(!state.skip_resent_event(&commit(120)));
+    assert_eq!(state.skipped_resent_events, 6);
 }
 
-#[tokio::test]
-async fn test_wal_persistent_metadata_keeps_relevant_events() {
-    let temp_dir = tempdir().unwrap();
-    let mut env = TestEnvironment::new(temp_dir, MooncakeTableConfig::default()).await;
-
-    let mut not_expected_events = Vec::new();
-    let mut expected_events = Vec::new();
-
-    // Append some data and flush to create WAL files
-    not_expected_events.push(env.append_row(1, "Alice", 25, 1, None).await);
-    not_expected_events.push(env.append_row(2, "Bob", 30, 1, None).await);
-    env.flush_table(3).await;
-
-    // We eventually discard this WAL file
-    env.force_wal_persistence(3).await;
-
-    // create more events
-    expected_events.push(env.append_row(3, "Charlie", 35, 4, None).await);
-    expected_events.push(env.append_row(4, "Diana", 40, 4, None).await);
-    expected_events.push(env.append_row(5, "Eve", 45, 5, Some(100)).await);
-    env.flush_table(5).await;
-
-    // Create an iceberg snapshot
-    let rx = env.table_event_manager.initiate_snapshot(5).await;
-    TableEventManager::synchronize_force_snapshot_request(rx, 5)
-        .await
-        .unwrap();
-
-    env.flush_table(6).await;
-    // we keep events in this WAL file, because xact 100 never goes into the iceberg snapshot
-    env.force_wal_persistence(6).await;
-
-    let wal_metadata = env
-        .get_latest_wal_metadata()
-        .await
-        .expect("No wal metadata found");
-
-    env.check_wal_events_from_metadata(&wal_metadata, &expected_events, &not_expected_events)
-        .await;
-
-    env.check_wal_metadata_invariants(&wal_metadata, Some(5), vec![100], vec![])
-        .await;
+fn new_table_handler_state(
+    initial_persistence_lsn: Option<u64>,
+    persistence_snapshot_lsn: Option<u64>,
+) -> TableHandlerState {
+    let (table_maintenance_completion_tx, _) = broadcast::channel(64usize);
+    let (force_snapshot_completion_tx, _) = watch::channel(None);
+    TableHandlerState::new(
+        table_maintenance_completion_tx,
+        force_snapshot_completion_tx,
+        initial_persistence_lsn,
+        persistence_snapshot_lsn,
+    )
 }
 
+/// Testing scenario: a recovered table skips a streamed commit at or below its snapshot LSN as
+/// re-sent, and its LSNs stay at the snapshot.
+#[test]
+fn test_streamed_commit_below_recovered_floor_is_skipped() {
+    let mut state = new_table_handler_state(Some(100), Some(100));
+    let commit = TableEvent::Commit {
+        lsn: 90,
+        xact_id: Some(7),
+    };
+    assert!(state.skip_resent_event(&commit));
+    assert_eq!(state.latest_commit_lsn, Some(100));
+    assert_eq!(state.table_consistent_view_lsn, Some(100));
+}
+
+/// Testing scenario: a streamed transaction that ends without being applied gives the table back
+/// its latest commit's consistent view, unless another transaction wrote since that commit.
+#[test]
+fn test_stream_ending_without_applying_restores_consistent_view() {
+    let append = |xact_id| TableEvent::Append {
+        row: MoonlinkRow::new(vec![RowValue::Int32(1)]),
+        xact_id,
+        lsn: 21,
+    };
+    let commit = |lsn, xact_id| TableEvent::Commit { lsn, xact_id };
+    let abort = |xact_id| TableEvent::StreamAbort { xact_id };
+
+    // Another streamed transaction still has writes until it ends too.
+    let mut state = new_table_handler_state(None, None);
+    state.update_table_lsns(&commit(20, None));
+    state.update_table_lsns(&append(Some(7)));
+    state.update_table_lsns(&append(Some(8)));
+    state.update_table_lsns(&abort(7));
+    assert_eq!(state.table_consistent_view_lsn, None);
+    state.update_table_lsns(&abort(8));
+    assert_eq!(state.table_consistent_view_lsn, Some(20));
+
+    // An uncommitted non-streamed write keeps the table without a consistent view.
+    let mut state = new_table_handler_state(None, None);
+    state.update_table_lsns(&commit(20, None));
+    state.update_table_lsns(&append(None));
+    state.update_table_lsns(&append(Some(7)));
+    state.update_table_lsns(&abort(7));
+    assert_eq!(state.table_consistent_view_lsn, None);
+    state.update_table_lsns(&commit(22, None));
+    assert_eq!(state.table_consistent_view_lsn, Some(22));
+
+    // A recovered table skips a re-sent streamed commit.
+    let mut state = new_table_handler_state(Some(100), Some(100));
+    state.update_table_lsns(&append(Some(7)));
+    assert_eq!(state.table_consistent_view_lsn, None);
+    assert!(state.skip_resent_event(&commit(90, Some(7))));
+    assert_eq!(state.table_consistent_view_lsn, Some(100));
+
+    // A streamed commit at or below an empty copy's boundary that the table has not applied: the
+    // boundary keeps it from moving the LSNs, and the stream's end gives the view back.
+    let mut state = new_table_handler_state(Some(50), Some(50));
+    state.start_initial_copy();
+    state.finish_initial_copy(/*lsn=*/ 100);
+    state.update_table_lsns(&append(Some(7)));
+    assert_eq!(state.table_consistent_view_lsn, None);
+    let streamed_commit = commit(90, Some(7));
+    assert!(!state.skip_resent_event(&streamed_commit));
+    state.update_table_lsns(&streamed_commit);
+    assert_eq!(state.latest_commit_lsn, Some(50));
+    assert_eq!(state.table_consistent_view_lsn, Some(50));
+}
+
+/// Testing scenario: after an empty initial copy the table has applied no commit, so a streamed
+/// commit at or below the copy boundary is not a re-send; the boundary keeps it from moving the
+/// table's LSNs. A streamed commit above the boundary moves them.
+#[test]
+fn test_streamed_commit_below_empty_copy_boundary_does_not_move_lsns() {
+    let mut state = new_table_handler_state(None, None);
+    state.start_initial_copy();
+    state.finish_initial_copy(/*lsn=*/ 100);
+    let commit = TableEvent::Commit {
+        lsn: 90,
+        xact_id: Some(7),
+    };
+    assert!(!state.skip_resent_event(&commit));
+    assert!(!state.should_discard_event(&commit));
+    state.update_table_lsns(&commit);
+    assert_eq!(state.latest_commit_lsn, None);
+    assert_eq!(state.table_consistent_view_lsn, None);
+
+    let commit = TableEvent::Commit {
+        lsn: 150,
+        xact_id: Some(8),
+    };
+    state.update_table_lsns(&commit);
+    assert_eq!(state.latest_commit_lsn, Some(150));
+    assert_eq!(state.table_consistent_view_lsn, Some(150));
+}
+
+/// Testing scenario: finishing an initial copy never lowers a replay floor.
+#[test]
+fn test_finish_initial_copy_keeps_higher_floor() {
+    let mut state = new_table_handler_state(Some(200), None);
+    state.latest_commit_lsn = Some(200);
+    state.start_initial_copy();
+    state.initial_copy_loaded_files = true;
+    state.finish_initial_copy(/*lsn=*/ 100);
+    assert_eq!(state.initial_persistence_lsn, Some(200));
+    assert_eq!(state.latest_commit_lsn, Some(200));
+}
+
+/// Testing scenario: a commit behind the table's commit LSN (a re-sent transaction the replay
+/// floors missed) errors the mirror instead of being applied; a streamed one is aborted too.
+#[rstest::rstest]
+#[case::non_streamed(None)]
+#[case::streamed(Some(7))]
 #[tokio::test]
-async fn test_wal_persistent_metadata_truncates_correctly() {
-    let temp_dir = tempdir().unwrap();
-    let mut env = TestEnvironment::new(temp_dir, MooncakeTableConfig::default()).await;
+async fn test_commit_behind_table_errors_the_mirror(#[case] xact_id: Option<u32>) {
+    use crate::storage::mooncake_table::test_utils::{test_row, test_table, TestContext};
+    let context = TestContext::new("commit_behind_table");
+    let mut table = test_table(&context, "table", IdentityProp::Keys(vec![0])).await;
+    table.append(test_row(1, "A", 20)).unwrap();
+    table.commit(/*lsn=*/ 100);
+    let mut state = new_table_handler_state(None, None);
 
-    let mut not_expected_events = Vec::new();
-    let mut expected_events = Vec::new();
+    match xact_id {
+        Some(xact_id) => table
+            .append_in_stream_batch(test_row(2, "B", 21), xact_id)
+            .unwrap(),
+        None => table.append(test_row(2, "B", 21)).unwrap(),
+    }
+    TableHandler::commit_and_attempt_flush(
+        /*lsn=*/ 50, xact_id, &mut state, &mut table, /*force_flush_requested=*/ false,
+    )
+    .await;
 
-    // Append some data and flush to create WAL files
-    not_expected_events.push(env.append_row(1, "Alice", 25, 1, None).await);
-    not_expected_events.push(env.append_row(2, "Bob", 30, 1, None).await);
-    not_expected_events.push(env.append_row(5, "Eve", 45, 0, Some(100)).await);
-    env.flush_table(3).await;
-
-    env.force_wal_persistence(3).await;
-
-    // create more events
-    not_expected_events.push(env.append_row(3, "Charlie", 35, 4, None).await);
-    not_expected_events.push(env.append_row(4, "Diana", 40, 4, None).await);
-    not_expected_events.push(env.stream_commit(5, 100).await);
-
-    env.flush_table(6).await;
-    // we discard all events up to this WAL file, because xact 100 goes into the iceberg snapshot
-    env.force_wal_persistence(6).await;
-
-    expected_events.push(env.append_row(7, "Frank", 50, 0, Some(101)).await);
-    env.flush_table(7).await;
-    // we keep events in this WAL file, because xact 101 never goes into the iceberg snapshot
-    env.force_wal_persistence(7).await;
-
-    // Create an iceberg snapshot
-    // None of the files before this are relevant, so we truncate them and lowest relevant file >= 2
-    let rx = env.table_event_manager.initiate_snapshot(7).await;
-    TableEventManager::synchronize_force_snapshot_request(rx, 7)
-        .await
-        .unwrap();
-
-    expected_events.push(env.append_row(8, "George", 60, 9, Some(102)).await);
-    expected_events.push(env.commit(9).await);
-    // we keep events in this WAL file, because the previous exact 101 is still uncommitted
-    env.force_wal_persistence(9).await;
-
-    let wal_metadata = env
-        .get_latest_wal_metadata()
-        .await
-        .expect("No wal metadata found");
-
-    env.check_wal_events_from_metadata(&wal_metadata, &expected_events, &not_expected_events)
-        .await;
-
-    env.check_wal_metadata_invariants(&wal_metadata, Some(7), vec![101, 102], vec![100])
-        .await;
+    assert!(state.is_errored());
+    assert_eq!(table.get_commit_lsn_baseline(), 100);
+    if let Some(xact_id) = xact_id {
+        assert!(!table.has_transaction_stream(xact_id));
+    }
 }
 
 /// ---- Util functions unit test ----
@@ -2110,6 +2133,19 @@ fn test_get_persisted_table_lsn() {
         let persisted_table_lsn =
             table_handler_state.get_persisted_table_lsn(persistence_snapshot_lsn, replication_lsn);
         assert_eq!(persisted_table_lsn, 1);
+    }
+
+    // Case-3, not Case-1: a commit that is not persisted yet, and a write after it clears the
+    // consistent view.
+    {
+        let persistence_snapshot_lsn = None;
+        let replication_lsn = 5;
+        table_handler_state.latest_commit_lsn = Some(4);
+        table_handler_state.table_consistent_view_lsn = None;
+
+        let persisted_table_lsn =
+            table_handler_state.get_persisted_table_lsn(persistence_snapshot_lsn, replication_lsn);
+        assert_eq!(persisted_table_lsn, 0);
     }
 
     // Case-2: table is at a consistent state, but iceberg persistence doesn't catch up.
@@ -2207,6 +2243,7 @@ async fn test_append_only_table_full_pipeline() {
     // Create a test environment with append-only configuration
     let temp_dir = tempdir().unwrap();
     let mooncake_table_config = MooncakeTableConfig {
+        mem_slice_bytes: usize::MAX,
         append_only: true, // Enable append-only mode
         row_identity: IdentityProp::None,
         batch_size: 2,
@@ -2322,6 +2359,7 @@ async fn test_append_only_table_high_volume() {
     // Test append-only table with high volume of data
     let temp_dir = tempdir().unwrap();
     let mooncake_table_config = MooncakeTableConfig {
+        mem_slice_bytes: usize::MAX,
         append_only: true,
         row_identity: IdentityProp::None,
         batch_size: 10,
@@ -2376,6 +2414,7 @@ async fn test_append_only_table_basic() {
     // Create a test environment with append-only configuration
     let temp_dir = tempdir().unwrap();
     let mooncake_table_config = MooncakeTableConfig {
+        mem_slice_bytes: usize::MAX,
         append_only: true, // Enable append-only mode
         row_identity: IdentityProp::None,
         batch_size: 2,
@@ -2439,6 +2478,7 @@ async fn test_append_only_table_basic() {
 async fn test_batch_ingestion() {
     let temp_dir = tempdir().unwrap();
     let mooncake_table_config = MooncakeTableConfig {
+        mem_slice_bytes: usize::MAX,
         append_only: true, // Enable append-only mode
         row_identity: IdentityProp::None,
         batch_size: 2,
@@ -2470,43 +2510,6 @@ async fn test_batch_ingestion() {
     env.verify_snapshot(10, &[1, 1, 2, 2, 3, 3]).await;
 }
 
-/// Testing scenario: batch upload parquet files from GCS into mooncake table.
-#[cfg(feature = "storage-gcs")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_batch_ingestion_with_gcs() {
-    use crate::storage::filesystem::gcs::gcs_test_utils::*;
-    use crate::storage::filesystem::gcs::test_guard::TestGuard as GcsTestGuard;
-
-    let (bucket, warehouse_uri) = get_test_gcs_bucket_and_warehouse();
-    let _test_guard = GcsTestGuard::new(bucket.clone()).await;
-    let accessor_config = create_gcs_storage_config(&warehouse_uri);
-    let storage_config = accessor_config.storage_config;
-    let gcs_filepath = format!("gs://{bucket}/object");
-
-    let temp_dir = tempdir().unwrap();
-    let mooncake_table_config = MooncakeTableConfig {
-        append_only: true, // Enable append-only mode
-        row_identity: IdentityProp::None,
-        batch_size: 2,
-        mem_slice_size: 1000,
-        snapshot_deletion_record_count: 1000,
-        temp_files_directory: temp_dir.path().to_str().unwrap().to_string(),
-        disk_slice_writer_config: DiskSliceWriterConfig::default(),
-        data_compaction_config: DataCompactionConfig::default(),
-        file_index_config: FileIndexMergeConfig::default(),
-        persistence_config: IcebergPersistenceConfig::default(),
-    };
-    let env = TestEnvironment::new(temp_dir, mooncake_table_config).await;
-
-    generate_parquet_file_in_gcs(storage_config.clone(), &gcs_filepath).await;
-    env.bulk_upload_files(vec![gcs_filepath], storage_config.clone(), /*lsn=*/ 10)
-        .await;
-
-    // Validate bulk ingestion result.
-    env.set_readable_lsn(10);
-    env.verify_snapshot(10, &[1, 2, 3]).await;
-}
-
 /// Testing scenario: batch upload parquet files from S3 into mooncake table.
 #[cfg(feature = "storage-s3")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2522,6 +2525,7 @@ async fn test_batch_ingestion_with_s3() {
 
     let temp_dir = tempdir().unwrap();
     let mooncake_table_config = MooncakeTableConfig {
+        mem_slice_bytes: usize::MAX,
         append_only: true, // Enable append-only mode
         row_identity: IdentityProp::None,
         batch_size: 2,
@@ -2561,7 +2565,6 @@ async fn test_alter_table() {
         row: MoonlinkRow::new(vec![RowValue::Int32(2), RowValue::Int32(30)]),
         lsn: 1,
         xact_id: None,
-        is_recovery: false,
     })
     .await;
     env.commit(2).await;
@@ -2573,14 +2576,13 @@ async fn test_alter_table() {
 }
 
 #[tokio::test]
-async fn test_initial_copy_iceberg_ack_without_wal() {
+async fn test_initial_copy_iceberg_ack() {
     let mut env = TestEnvironment::default().await;
     let sender = env.handler.get_event_sender();
 
-    // Subscribe to iceberg flush LSN and inspect WAL flush LSN
+    // Subscribe to iceberg flush LSN.
     let mut flush_lsn_rx = env.table_event_manager.subscribe_flush_lsn();
     assert_eq!(*flush_lsn_rx.borrow(), 0);
-    assert_eq!(*env.wal_flush_lsn_rx.borrow(), 0);
 
     // Start initial copy (enter blocking state for CDC events)
     sender
@@ -2617,9 +2619,6 @@ async fn test_initial_copy_iceberg_ack_without_wal() {
         }
         flush_lsn_rx.changed().await.unwrap();
     }
-
-    // WAL flush LSN should still be zero since initial copy bypasses WAL
-    assert_eq!(*env.wal_flush_lsn_rx.borrow(), 0);
 
     // Verify the snapshot contains the rows from the parquet (ids 1,2,3)
     env.verify_snapshot(start_lsn, &[1, 2, 3]).await;

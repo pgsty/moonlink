@@ -1,6 +1,5 @@
 use super::moonlink_type::RowValue;
 use crate::row::arrow_converter;
-use ahash::AHasher;
 use arrow::array::Array;
 use arrow::datatypes::Field;
 use arrow::record_batch::RecordBatch;
@@ -21,8 +20,8 @@ impl MoonlinkRow {
         Self { values }
     }
 
-    /// Convert an arrow RecordBatch into moonlink rows.
-    pub fn from_record_batch(batch: &RecordBatch) -> Vec<MoonlinkRow> {
+    /// Convert an arrow RecordBatch into moonlink rows; fails on column types rows cannot hold.
+    pub fn from_record_batch(batch: &RecordBatch) -> crate::Result<Vec<MoonlinkRow>> {
         arrow_converter::record_batch_to_moonlink_row(batch)
     }
 
@@ -218,33 +217,32 @@ impl MoonlinkRow {
         identity: &IdentityProp,
     ) -> bool {
         assert!(self.is_extracted_identity_row(identity));
-        let file = tokio::fs::File::open(file_name).await.unwrap();
-        let stream_builder = ParquetRecordBatchStreamBuilder::new(file).await.unwrap();
-        let row_groups = stream_builder.metadata().row_groups();
-        let mut target_row_group = 0;
-        let mut row_count: usize = 0;
-        for row_group in row_groups {
-            if row_count + row_group.num_rows() as usize > offset {
-                break;
-            }
-            row_count += row_group.num_rows() as usize;
-            target_row_group += 1;
-        }
-        let proj_mask = ProjectionMask::roots(
-            stream_builder.metadata().file_metadata().schema_descr(),
-            identity.get_key_indices(self.values.len()),
-        );
-        let mut reader = stream_builder
-            .with_row_groups(vec![target_row_group])
-            .with_offset(offset - row_count)
-            .with_limit(1)
-            .with_batch_size(1)
-            .with_projection(proj_mask.clone())
-            .build()
-            .unwrap();
-        let mut batch_reader = reader.next_row_group().await.unwrap().unwrap();
-        let batch = batch_reader.next().unwrap().unwrap();
+        let batch = read_parquet_row_at_offset(
+            file_name,
+            offset,
+            Some(identity.get_key_indices(self.values.len())),
+        )
+        .await;
         self.equals_record_batch_at_offset_impl(&batch, 0)
+    }
+
+    /// The row at `offset` of a parquet data file.
+    pub async fn read_from_parquet_at_offset(file_name: &str, offset: usize) -> MoonlinkRow {
+        let batch = read_parquet_row_at_offset(file_name, offset, /*columns=*/ None).await;
+        Self::from_record_batch(&batch)
+            .expect("a data file moonlink wrote converts back to rows")
+            .pop()
+            .unwrap()
+    }
+
+    /// A hash of the whole row independent of [`IdentityProp::get_lookup_key`], which tells apart
+    /// rows whose lookup keys collide without keeping the row.
+    pub fn full_row_fingerprint(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for value in self.values.iter() {
+            value.hash(&mut hasher);
+        }
+        hasher.finish()
     }
 
     pub fn equals_moonlink_row(&self, other: &Self, identity: &IdentityProp) -> bool {
@@ -264,6 +262,43 @@ impl MoonlinkRow {
             }
         }
     }
+}
+
+/// The row at `offset` of a parquet data file, with only `columns` (all when none).
+async fn read_parquet_row_at_offset(
+    file_name: &str,
+    offset: usize,
+    columns: Option<Vec<usize>>,
+) -> RecordBatch {
+    let file = tokio::fs::File::open(file_name).await.unwrap();
+    let stream_builder = ParquetRecordBatchStreamBuilder::new(file).await.unwrap();
+    let row_groups = stream_builder.metadata().row_groups();
+    let mut target_row_group = 0;
+    let mut row_count: usize = 0;
+    for row_group in row_groups {
+        if row_count + row_group.num_rows() as usize > offset {
+            break;
+        }
+        row_count += row_group.num_rows() as usize;
+        target_row_group += 1;
+    }
+    let proj_mask = match columns {
+        Some(columns) => ProjectionMask::roots(
+            stream_builder.metadata().file_metadata().schema_descr(),
+            columns,
+        ),
+        None => ProjectionMask::all(),
+    };
+    let mut reader = stream_builder
+        .with_row_groups(vec![target_row_group])
+        .with_offset(offset - row_count)
+        .with_limit(1)
+        .with_batch_size(1)
+        .with_projection(proj_mask)
+        .build()
+        .unwrap();
+    let mut batch_reader = reader.next_row_group().await.unwrap().unwrap();
+    batch_reader.next().unwrap().unwrap()
 }
 
 /// Identity for a single row.
@@ -334,20 +369,8 @@ impl IdentityProp {
     pub fn get_lookup_key(&self, row: &MoonlinkRow) -> u64 {
         match self {
             IdentityProp::SinglePrimitiveKey(key) => row.values[*key].to_u64_key(),
-            IdentityProp::Keys(keys) => {
-                let mut hasher = AHasher::default();
-                for key in keys {
-                    row.values[*key].hash(&mut hasher);
-                }
-                hasher.finish()
-            }
-            IdentityProp::FullRow => {
-                let mut hasher = AHasher::default();
-                for value in row.values.iter() {
-                    value.hash(&mut hasher);
-                }
-                hasher.finish()
-            }
+            IdentityProp::Keys(keys) => stable_lookup_key(keys.iter().map(|k| &row.values[*k])),
+            IdentityProp::FullRow => stable_lookup_key(row.values.iter()),
             IdentityProp::None => 0, // Append-only tables don't need meaningful lookup keys
         }
     }
@@ -359,19 +382,9 @@ impl IdentityProp {
             IdentityProp::SinglePrimitiveKey(_) => row.values[0].to_u64_key(),
             IdentityProp::Keys(keys) => {
                 assert_eq!(row.values.len(), keys.len());
-                let mut hasher = AHasher::default();
-                for i in 0..keys.len() {
-                    row.values[i].hash(&mut hasher);
-                }
-                hasher.finish()
+                stable_lookup_key(row.values.iter())
             }
-            IdentityProp::FullRow => {
-                let mut hasher = AHasher::default();
-                for value in row.values.iter() {
-                    value.hash(&mut hasher);
-                }
-                hasher.finish()
-            }
+            IdentityProp::FullRow => stable_lookup_key(row.values.iter()),
             IdentityProp::None => 0,
         }
     }
@@ -384,6 +397,94 @@ impl IdentityProp {
             IdentityProp::None => {
                 panic!("IdentityProp::None should not be used for identity check requirements")
             }
+        }
+    }
+}
+
+/// Version of the lookup-key hash written into persisted file indices. Bump when
+/// [`stable_lookup_key`] changes; tables persisted with an older version get their file indices
+/// rebuilt on load.
+pub(crate) const LOOKUP_KEY_VERSION: u32 = 2;
+
+/// Fixed SipHash-1-3 keys. Lookup keys are persisted in file indices, so the hash must be the same
+/// in every process, on every machine and across releases (std/ahash hashers are not).
+const LOOKUP_KEY_SIP_KEYS: (u64, u64) = (0x6d6f_6f6e_6c69_6e6b, 0x6c6f_6f6b_7570_6b65);
+
+/// Hash identity values into a lookup key using a canonical, version-independent encoding.
+pub(crate) fn stable_lookup_key<'a>(values: impl Iterator<Item = &'a RowValue>) -> u64 {
+    let mut hasher =
+        siphasher::sip::SipHasher13::new_with_keys(LOOKUP_KEY_SIP_KEYS.0, LOOKUP_KEY_SIP_KEYS.1);
+    for value in values {
+        write_canonical_value(value, &mut hasher);
+    }
+    #[cfg(test)]
+    {
+        hasher.finish() ^ LEGACY_LOOKUP_KEY_SALT_FOR_TEST.with(|salt| salt.get())
+    }
+    #[cfg(not(test))]
+    {
+        hasher.finish()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Non-zero simulates an older moonlink: lookup keys differ and commits carry no key version.
+    pub(crate) static LEGACY_LOOKUP_KEY_SALT_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+fn write_canonical_value(value: &RowValue, hasher: &mut siphasher::sip::SipHasher13) {
+    match value {
+        RowValue::Int32(v) => {
+            hasher.write(&[1]);
+            hasher.write(&v.to_le_bytes());
+        }
+        RowValue::Int64(v) => {
+            hasher.write(&[2]);
+            hasher.write(&v.to_le_bytes());
+        }
+        // Bit patterns, matching how RowValue has always been hashed.
+        RowValue::Float32(v) => {
+            hasher.write(&[3]);
+            hasher.write(&v.to_bits().to_le_bytes());
+        }
+        RowValue::Float64(v) => {
+            hasher.write(&[4]);
+            hasher.write(&v.to_bits().to_le_bytes());
+        }
+        RowValue::Decimal(v) => {
+            hasher.write(&[5]);
+            hasher.write(&v.to_le_bytes());
+        }
+        RowValue::Bool(v) => {
+            hasher.write(&[6, *v as u8]);
+        }
+        RowValue::ByteArray(bytes) => {
+            hasher.write(&[7]);
+            hasher.write(&(bytes.len() as u64).to_le_bytes());
+            hasher.write(bytes);
+        }
+        RowValue::FixedLenByteArray(bytes) => {
+            hasher.write(&[8]);
+            hasher.write(bytes);
+        }
+        RowValue::Array(values) => {
+            hasher.write(&[9]);
+            hasher.write(&(values.len() as u64).to_le_bytes());
+            for v in values {
+                write_canonical_value(v, hasher);
+            }
+        }
+        RowValue::Struct(values) => {
+            hasher.write(&[10]);
+            hasher.write(&(values.len() as u64).to_le_bytes());
+            for v in values {
+                write_canonical_value(v, hasher);
+            }
+        }
+        RowValue::Null => {
+            hasher.write(&[0]);
         }
     }
 }

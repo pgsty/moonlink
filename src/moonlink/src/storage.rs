@@ -11,8 +11,8 @@ pub(crate) mod path_utils;
 pub(crate) mod snapshot_options;
 pub(crate) mod storage_utils;
 pub(crate) mod table;
+pub(crate) mod task_supervisor;
 pub(super) mod timer;
-pub(crate) mod wal;
 
 pub use crate::event_sync::EventSyncReceiver;
 pub use cache::object_storage::base_cache::CacheTrait;
@@ -29,9 +29,6 @@ pub use filesystem::storage_config::StorageConfig;
 pub use index::index_merge_config::FileIndexMergeConfig;
 pub use mooncake_table::table_config::TableConfig as MoonlinkTableConfig;
 pub use mooncake_table::table_event_manager::TableEventManager;
-pub use mooncake_table::table_secret::{
-    SecretEntry as MoonlinkTableSecret, SecretType as MoonlinkSecretType,
-};
 pub use mooncake_table::table_status::TableSnapshotStatus;
 pub use mooncake_table::table_status_reader::TableStatusReader;
 pub use mooncake_table::MooncakeTable;
@@ -42,16 +39,10 @@ pub use mooncake_table_config::IcebergPersistenceConfig;
 pub use mooncake_table_config::MooncakeTableConfig;
 pub use table::common::table_manager::TableManager;
 pub use table::iceberg::base_iceberg_snapshot_fetcher::BaseIcebergSnapshotFetcher;
-pub use table::iceberg::cloud_security_config::{AwsSecurityConfig, CloudSecurityConfig};
 pub use table::iceberg::iceberg_snapshot_fetcher::IcebergSnapshotFetcher;
 pub use table::iceberg::iceberg_table_config::FileCatalogConfig as IcebergFileCatalogConfig;
-#[cfg(all(feature = "catalog-glue", feature = "storage-s3"))]
-pub use table::iceberg::iceberg_table_config::GlueCatalogConfig as IcebergGlueCatalogConfig;
-#[cfg(feature = "catalog-rest")]
-pub use table::iceberg::iceberg_table_config::RestCatalogConfig as IcebergRestCatalogConfig;
 pub use table::iceberg::iceberg_table_config::{IcebergCatalogConfig, IcebergTableConfig};
 pub use table::iceberg::iceberg_table_manager::IcebergTableManager;
-pub use wal::{PersistentWalMetadata, WalConfig, WalManager, WalTransactionState};
 
 pub use filesystem::accessor::base_filesystem_accessor::BaseFileSystemAccess;
 

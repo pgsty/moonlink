@@ -3,13 +3,12 @@ use crate::{Error, Result};
 use arrow_schema::Schema as ArrowSchema;
 use moonlink::event_sync::create_table_event_syncer;
 use moonlink::table_handler_timer::create_table_handler_timers;
-use moonlink::PersistentWalMetadata;
 use moonlink::ReadStateFilepathRemap;
 use moonlink::{
-    row::IdentityProp, AccessorConfig, BaseFileSystemAccess, EventSyncReceiver, EventSyncSender,
-    FileSystemAccessor, IcebergTableConfig, MooncakeTable, MooncakeTableConfig, MoonlinkSecretType,
-    MoonlinkTableConfig, MoonlinkTableSecret, ObjectStorageCache, ReadStateManager, StorageConfig,
-    TableEvent, TableEventManager, TableHandler, TableStatusReader, WalConfig, WalManager,
+    row::IdentityProp, AccessorConfig, EventSyncReceiver, EventSyncSender, FileSystemAccessor,
+    IcebergTableConfig, MooncakeTable, MooncakeTableConfig, MoonlinkTableConfig,
+    ObjectStorageCache, ReadStateManager, StorageConfig, TableEvent, TableEventManager,
+    TableHandler, TableStatusReader,
 };
 use moonlink::{CommitState, ReplicationState};
 
@@ -45,11 +44,14 @@ pub struct TableResources {
     pub table_event_manager: TableEventManager,
     pub table_status_reader: TableStatusReader,
     pub commit_state: Option<Arc<CommitState>>,
+    pub replication_state: Arc<ReplicationState>,
     pub flush_lsn_rx: Option<watch::Receiver<u64>>,
-    pub wal_flush_lsn_rx: Option<watch::Receiver<u64>>,
-    pub wal_file_accessor: Arc<dyn BaseFileSystemAccess>,
-    pub wal_persistence_metadata: Option<PersistentWalMetadata>,
-    pub last_persistence_snapshot_lsn: Option<u64>,
+    /// Status of the table as the replication slot sees it: errored only once that is persisted
+    /// (see `spawn_errored_marker_writer`). Set when the table is added to replication.
+    pub slot_status_tx: Option<watch::Sender<moonlink::TableStatus>>,
+    /// The LSN the rows of the table's initial copy are committed at, if the copy loaded any.
+    /// They are only in memory until a snapshot at this LSN is persisted.
+    pub initial_copy_lsn: Option<u64>,
 }
 
 /// Util function to delete and re-create the given directory.
@@ -79,7 +81,6 @@ pub async fn build_table_components(
     base_path: &str,
     replication_state: &ReplicationState,
     table_components: TableComponents,
-    is_recovery: bool,
 ) -> Result<TableResources> {
     // Recreate write-through cache directory.
     let write_cache_path = PathBuf::from(base_path).join(&mooncake_table_id);
@@ -98,37 +99,6 @@ pub async fn build_table_components(
             )
         })?;
 
-    let wal_config = table_components
-        .moonlink_table_config
-        .wal_table_config
-        .clone();
-    let wal_file_accessor = Arc::new(FileSystemAccessor::new(
-        wal_config.get_accessor_config().clone(),
-    ));
-
-    let wal_persistence_metadata = {
-        if is_recovery {
-            let recovered_wal_metadata = WalManager::recover_from_persistent_wal_metadata(
-                wal_file_accessor.clone(),
-                wal_config.clone(),
-            )
-            .await;
-            recovered_wal_metadata
-        } else {
-            None
-        }
-    };
-
-    let wal_manager = if let Some(wal_persistence_metadata) = wal_persistence_metadata.clone() {
-        WalManager::from_persistent_wal_metadata(
-            wal_file_accessor.clone(),
-            wal_persistence_metadata,
-            wal_config.clone(),
-        )
-    } else {
-        WalManager::new(&wal_config)
-    };
-
     let table = MooncakeTable::new(
         arrow_schema,
         mooncake_table_id,
@@ -142,7 +112,6 @@ pub async fn build_table_components(
             .moonlink_table_config
             .mooncake_table_config
             .clone(),
-        wal_manager,
         Arc::new(table_components.object_storage_cache),
         Arc::new(FileSystemAccessor::new(
             table_components
@@ -157,37 +126,45 @@ pub async fn build_table_components(
     let last_persistence_snapshot_lsn = table.get_persistence_snapshot_lsn();
 
     let commit_state = CommitState::new();
+    // The replication LSN this table's readers and handler see: everything up to it has been
+    // delivered to the table. Up to its snapshot that holds already; beyond it, only once the
+    // stream gets there (the sink marks it with the shared one). Marking the shared LSN with this
+    // table's snapshot instead would let another recovered table, whose replay from the slot is
+    // still behind, serve stale reads.
+    let table_replication_state = ReplicationState::new();
     // Make a receiver first before possible mark operation, otherwise all receiver initializes with 0.
-    let replication_lsn_rx = replication_state.subscribe();
+    let replication_lsn_rx = table_replication_state.subscribe();
     let commit_lsn_rx = commit_state.subscribe();
+    // Readers rely on this order (union_read::LsnView): mark table commit LSNs before the replication LSN.
     if let Some(persistence_snapshot_lsn) = last_persistence_snapshot_lsn {
         commit_state.mark(persistence_snapshot_lsn);
-        replication_state.mark(persistence_snapshot_lsn);
+        table_replication_state.mark(persistence_snapshot_lsn);
     }
+    let handler_replication_lsn_rx = table_replication_state.subscribe();
 
+    let (event_sync_sender, event_sync_receiver) = create_table_event_syncer();
     let read_state_manager = ReadStateManager::new(
         &table,
         replication_lsn_rx,
         commit_lsn_rx,
+        event_sync_receiver.table_status_rx.clone(),
         table_components.read_state_filepath_remap,
     );
     let table_status_reader = TableStatusReader::new(
         &table_components.moonlink_table_config.iceberg_table_config,
         &table,
     );
-    let (event_sync_sender, event_sync_receiver) = create_table_event_syncer();
     let table_handler_timers = create_table_handler_timers();
     let table_handler = TableHandler::new(
         table,
         event_sync_sender,
         table_handler_timers,
-        replication_state.subscribe(),
+        handler_replication_lsn_rx,
         /*event_replay_tx=*/ None,
         /*table_event_replay_tx=*/ None,
     )
     .await;
     let flush_lsn_rx = event_sync_receiver.flush_lsn_rx.clone();
-    let wal_flush_lsn_rx = event_sync_receiver.wal_flush_lsn_rx.clone();
     let table_event_manager =
         TableEventManager::new(table_handler.get_event_sender(), event_sync_receiver);
     let event_sender = table_handler.get_event_sender();
@@ -198,11 +175,112 @@ pub async fn build_table_components(
         table_status_reader,
         table_event_manager,
         commit_state: Some(commit_state),
+        replication_state: table_replication_state,
         flush_lsn_rx: Some(flush_lsn_rx),
-        wal_flush_lsn_rx: Some(wal_flush_lsn_rx),
-        wal_file_accessor,
-        wal_persistence_metadata,
-        last_persistence_snapshot_lsn,
+        slot_status_tx: None,
+        initial_copy_lsn: None,
     };
     Ok(table_resource)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field};
+    use moonlink::row::IdentityProp;
+    use moonlink::{
+        AccessorConfig, IcebergCatalogConfig, IcebergTableConfig, MooncakeTableConfig,
+        MoonlinkTableConfig, ObjectStorageCache, ObjectStorageCacheConfig, StorageConfig,
+    };
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    async fn table_resources(dir: &tempfile::TempDir) -> (TableResources, Arc<ReplicationState>) {
+        let base = dir.path().to_str().unwrap().to_string();
+        let storage_config = StorageConfig::FileSystem {
+            root_directory: base.clone(),
+            atomic_write_dir: None,
+        };
+        let accessor_config = AccessorConfig::new_with_storage_config(storage_config);
+        let mut mooncake_table_config = MooncakeTableConfig::new(format!("{base}/temp"));
+        mooncake_table_config.append_only = false;
+        mooncake_table_config.row_identity = IdentityProp::FullRow;
+        let moonlink_table_config = MoonlinkTableConfig {
+            mooncake_table_config,
+            iceberg_table_config: IcebergTableConfig {
+                namespace: vec!["db".to_string()],
+                table_name: "t".to_string(),
+                data_accessor_config: accessor_config.clone(),
+                metadata_accessor_config: IcebergCatalogConfig::File { accessor_config },
+            },
+        };
+        let schema = ArrowSchema::new(vec![Field::new("id", DataType::Int64, false)
+            .with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                "0".to_string(),
+            )]))]);
+        let replication_state = ReplicationState::new();
+        let resources = build_table_components(
+            "db.t".to_string(),
+            schema,
+            "public.t".to_string(),
+            1,
+            &base,
+            &replication_state,
+            TableComponents {
+                read_state_filepath_remap: Arc::new(|path| path),
+                object_storage_cache: ObjectStorageCache::new(ObjectStorageCacheConfig::new(
+                    1 << 30,
+                    format!("{base}/cache"),
+                    true,
+                )),
+                moonlink_table_config,
+            },
+        )
+        .await
+        .unwrap();
+        (resources, replication_state)
+    }
+
+    /// Reads of a mirror that becomes errored while it runs fail with the errored message:
+    /// reads that start afterwards and reads that were already waiting for an LSN.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reads_of_a_table_errored_at_runtime_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (resources, _replication_state) = table_resources(&dir).await;
+        let reader = Arc::new(resources.read_state_manager);
+        reader.try_read(None).await.unwrap();
+
+        let waiting = tokio::spawn({
+            let reader = reader.clone();
+            async move { reader.try_read(Some(1u64 << 40)).await.map(|_| ()) }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished());
+
+        resources
+            .table_event_manager
+            .enter_errored("source schema changed".to_string())
+            .await
+            .unwrap();
+
+        let err = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("a read waiting for an LSN did not observe the errored state")
+            .unwrap()
+            .expect_err("waiting read must fail");
+        assert!(err.to_string().contains("source schema changed"), "{err}");
+        for lsn in [None, Some(0)] {
+            let err = reader
+                .try_read(lsn)
+                .await
+                .expect_err("read of an errored table must fail");
+            assert!(err.to_string().contains("out of sync"), "{err}");
+        }
+        let err = reader
+            .wait_for_lsn_coverage(0)
+            .await
+            .expect_err("snapshot LSN resolution of an errored table must fail");
+        assert!(err.to_string().contains("out of sync"), "{err}");
+    }
 }

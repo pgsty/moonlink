@@ -6,30 +6,67 @@ mod recovery_utils;
 pub mod table_config;
 pub mod table_status;
 
-use apache_avro::schema::Schema as AvroSchema;
 use arrow_schema::Schema;
 pub use error::{Error, Result};
 use futures::{stream, StreamExt, TryStreamExt};
+use moonlink::MooncakeTableId;
 pub use moonlink::ReadState;
-use moonlink::{MooncakeTableId, MoonlinkTableConfig};
 use moonlink::{ReadStateFilepathRemap, TableEventManager};
-pub use moonlink_connectors::rest_ingest::event_request::{
-    EventRequest, FileEventOperation, FileEventRequest, FlushRequest, IngestRequestPayload,
-    RowEventOperation, RowEventRequest, SnapshotRequest,
-};
-pub use moonlink_connectors::rest_ingest::rest_event::RestEvent;
-pub use moonlink_connectors::rest_ingest::rest_source::RestSource;
 use moonlink_connectors::ReplicationManager;
-pub use moonlink_connectors::REST_API_URI;
 use moonlink_metadata_store::base_metadata_store::MetadataStoreTrait;
+#[cfg(feature = "test-utils")]
+pub use recovery_utils::set_recovery_delay_between_tables_for_test;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{watch, RwLock};
 
 use crate::recovery_utils::BackendAttributes;
 use crate::table_status::TableStatus;
 
 /// Type alias for filepath remap function, which remaps http URI to local filepath if possible.
 type HttpFilepathRemap = std::sync::Arc<dyn Fn(String) -> String + Send + Sync>;
+
+/// Upper bound for a scan or snapshot request waiting until replication reaches the requested
+/// LSN. The pg_mooncake backend issuing the request blocks uninterruptibly (no statement_timeout /
+/// cancel) for this long.
+const DEFAULT_LSN_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Environment variable overriding [`DEFAULT_LSN_WAIT_TIMEOUT`], in whole seconds.
+pub const LSN_WAIT_TIMEOUT_ENV: &str = "MOONLINK_LSN_WAIT_TIMEOUT_SECS";
+
+/// Larger LSN wait timeouts are clamped to this; it also keeps the value far from wrapping.
+const MAX_LSN_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn clamp_lsn_wait_timeout(timeout: Duration) -> Duration {
+    if timeout > MAX_LSN_WAIT_TIMEOUT {
+        tracing::warn!(
+            ?timeout,
+            "LSN wait timeout clamped to {}s",
+            MAX_LSN_WAIT_TIMEOUT.as_secs()
+        );
+        return MAX_LSN_WAIT_TIMEOUT;
+    }
+    timeout
+}
+
+/// The LSN wait timeout for a value of [`LSN_WAIT_TIMEOUT_ENV`]; unset or invalid gives the default.
+fn parse_lsn_wait_timeout(value: Option<&str>) -> Duration {
+    let Some(value) = value else {
+        return DEFAULT_LSN_WAIT_TIMEOUT;
+    };
+    match value.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => clamp_lsn_wait_timeout(Duration::from_secs(secs)),
+        _ => {
+            tracing::warn!(
+                value,
+                "invalid {LSN_WAIT_TIMEOUT_ENV} (expected a positive number of seconds), using {}s",
+                DEFAULT_LSN_WAIT_TIMEOUT.as_secs()
+            );
+            DEFAULT_LSN_WAIT_TIMEOUT
+        }
+    }
+}
 
 /// Max concurrency to fetch parquet metadata in parallel.
 const DEFAULT_PARQUET_METADATA_FETCH_PARALLELISM: usize = 128;
@@ -46,9 +83,10 @@ pub struct MoonlinkBackend {
     // Metadata storage accessor.
     metadata_store_accessor: Box<dyn MetadataStoreTrait>,
 
-    replication_manager: RwLock<ReplicationManager>,
+    replication_manager: Arc<RwLock<ReplicationManager>>,
 
-    event_api_sender: Option<tokio::sync::mpsc::Sender<EventRequest>>,
+    /// See [`DEFAULT_LSN_WAIT_TIMEOUT`].
+    lsn_wait_timeout_ms: AtomicU64,
 }
 
 impl MoonlinkBackend {
@@ -119,40 +157,103 @@ impl MoonlinkBackend {
 
         let backend_attributes = BackendAttributes {
             temp_files_dir: temp_files_dir.to_str().unwrap().to_string(),
-            base_path: base_path.to_str().unwrap().to_string(),
+            base_path: base_path_str.to_string(),
         };
-        recovery_utils::recover_all_tables(
+        let pending_recoveries = recovery_utils::recover_all_tables(
             backend_attributes,
             &*metadata_store_accessor,
             read_state_filepath_remap.clone(),
             &mut replication_manager,
         )
         .await?;
+        let replication_manager = Arc::new(RwLock::new(replication_manager));
+        recovery_utils::watch_placeholders(Arc::downgrade(&replication_manager));
+        if !pending_recoveries.is_empty() {
+            recovery_utils::retry_pending_recoveries(
+                Arc::downgrade(&replication_manager),
+                pending_recoveries,
+            );
+        }
 
         Ok(Self {
             base_path: base_path_str.to_string(),
             read_state_filepath_remap,
             http_filepath_remap,
             temp_files_dir: temp_files_dir.to_str().unwrap().to_string(),
-            replication_manager: RwLock::new(replication_manager),
+            replication_manager,
             metadata_store_accessor,
-            event_api_sender: None,
+            lsn_wait_timeout_ms: AtomicU64::new(
+                parse_lsn_wait_timeout(std::env::var(LSN_WAIT_TIMEOUT_ENV).ok().as_deref())
+                    .as_millis() as u64,
+            ),
         })
+    }
+
+    /// Override how long [`Self::scan_table`] and [`Self::create_snapshot`] wait for replication
+    /// to reach the requested LSN.
+    pub fn set_lsn_wait_timeout(&self, timeout: Duration) {
+        self.lsn_wait_timeout_ms.store(
+            clamp_lsn_wait_timeout(timeout).as_millis() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn lsn_wait_timeout(&self) -> Duration {
+        Duration::from_millis(self.lsn_wait_timeout_ms.load(Ordering::Relaxed))
     }
 
     /// Create an iceberg snapshot with the given LSN, return when the a snapshot is successfully created.
     /// If the requested database or table doesn't exist, return [`TableNotFound`] error.
+    /// Only the wait for replication to reach `lsn` is bounded ([`LSN_WAIT_TIMEOUT_ENV`]).
     pub async fn create_snapshot(&self, database: String, table: String, lsn: u64) -> Result<()> {
         validate_not_empty(&database, "database")?;
         validate_not_empty(&table, "table")?;
 
+        let mooncake_table_id = MooncakeTableId { database, table };
+        let table_reader = {
+            let manager = self.replication_manager.read().await;
+            manager.get_table_reader(&mooncake_table_id)?
+        };
+        // Resolve the LSN first, without any manager lock: `lsn` is the end of the caller's last
+        // transaction, which need not be a commit of this table.
+        let timeout = self.lsn_wait_timeout();
+        let target_lsn =
+            match tokio::time::timeout(timeout, table_reader.wait_for_lsn_coverage(lsn)).await {
+                Ok(target_lsn) => target_lsn?,
+                Err(_) => {
+                    let (_, commit_lsn, replication_lsn) = table_reader.lsn_status();
+                    return Err(Error::lsn_wait_timeout(format!(
+                        "mirror {mooncake_table_id}: replication did not reach LSN {lsn} within \
+                         {timeout:?} (replicated up to {replication_lsn}, committed {commit_lsn}); \
+                         replication may be stalled or catching up, or src_uri points at a \
+                         different server whose LSNs are not comparable. Retry, or check \
+                         mooncake.list_tables()."
+                    )));
+                }
+            };
         let rx = {
             let mut manager = self.replication_manager.write().await;
-            let mooncake_table_id = MooncakeTableId { database, table };
             let writer = manager.get_table_event_manager(&mooncake_table_id)?;
-            writer.initiate_snapshot(lsn).await
+            writer.initiate_snapshot(target_lsn).await
         };
-        TableEventManager::synchronize_force_snapshot_request(rx, lsn).await?;
+        // Not bounded: persisting a large backlog to Iceberg legitimately takes long. The wait
+        // ends when the snapshot is persisted, or with an error once the mirror is errored or
+        // dropped; a stuck-but-healthy table handler keeps the caller waiting.
+        TableEventManager::synchronize_force_snapshot_request(rx, target_lsn).await?;
+        Ok(())
+    }
+
+    /// Test-only: make a mirror's table handler task die, like an unexpected crash.
+    #[cfg(feature = "test-utils")]
+    pub async fn kill_table_handler_for_testing(
+        &self,
+        database: String,
+        table: String,
+    ) -> Result<()> {
+        let mut manager = self.replication_manager.write().await;
+        let mooncake_table_id = MooncakeTableId { database, table };
+        let writer = manager.get_table_event_manager(&mooncake_table_id)?;
+        writer.kill_table_handler_for_testing().await;
         Ok(())
     }
 
@@ -176,6 +277,12 @@ impl MoonlinkBackend {
     ) -> Result<()> {
         validate_not_empty(&database, "database")?;
         validate_not_empty(&table, "table")?;
+        if input_schema.is_some() {
+            return Err(Error::invalid_argument(
+                "input schema is only supported for event ingestion, which has been removed"
+                    .to_string(),
+            ));
+        }
 
         let mooncake_table_id = MooncakeTableId {
             database: database.clone(),
@@ -183,81 +290,157 @@ impl MoonlinkBackend {
         };
 
         // Add mooncake table to replication, and create corresponding mooncake table.
-        let moonlink_table_config: Result<MoonlinkTableConfig> = {
-            let mut manager = self.replication_manager.write().await;
-            if src_uri == REST_API_URI {
-                let cur_moonlink_table_config = config_utils::parse_event_table_config(
-                    &table_config,
-                    &mooncake_table_id,
-                    &self.base_path,
-                    &self.temp_files_dir,
-                )?;
-                manager
-                    .add_rest_table(
-                        &src_uri,
-                        mooncake_table_id,
-                        &src_table_name,
-                        input_schema.expect("arrow_schema is required for REST API"),
-                        cur_moonlink_table_config.clone(),
-                        self.read_state_filepath_remap.clone(),
-                        /*flush_lsn=*/ None,
-                    )
-                    .await?;
-                Ok(cur_moonlink_table_config)
-            } else {
-                let mut cur_moonlink_table_config = config_utils::parse_replication_table_config(
-                    &table_config,
-                    &mooncake_table_id,
-                    &self.base_path,
-                    &self.temp_files_dir,
-                )?;
-                // Moonlink table config will get updated later at replication manager.
-                manager
-                    .add_table(
-                        &src_uri,
-                        mooncake_table_id,
-                        &src_table_name,
-                        &mut cur_moonlink_table_config,
-                        self.read_state_filepath_remap.clone(),
-                        /*is_recovery=*/ false,
-                    )
-                    .await?;
-                Ok(cur_moonlink_table_config)
-            }
+        let (moonlink_table_config, initial_copy_lsn, mirror_status) = {
+            let mut manager = self.lock_manager_for_new_mirror(&src_uri).await?;
+            let mut cur_moonlink_table_config = config_utils::parse_replication_table_config(
+                &table_config,
+                &mooncake_table_id,
+                &self.base_path,
+                &self.temp_files_dir,
+            )?;
+            // Moonlink table config will get updated later at replication manager.
+            let initial_copy_lsn = manager
+                .add_table(
+                    &src_uri,
+                    mooncake_table_id.clone(),
+                    &src_table_name,
+                    &mut cur_moonlink_table_config,
+                    self.read_state_filepath_remap.clone(),
+                    /*is_recovery=*/ false,
+                )
+                .await?;
+            // Tells this mirror apart from one re-created under its name after a concurrent drop.
+            let mirror_status = manager
+                .get_table_event_manager(&mooncake_table_id)?
+                .subscribe_table_status();
+            (cur_moonlink_table_config, initial_copy_lsn, mirror_status)
         };
 
-        // Create metadata store entry.
-        self.metadata_store_accessor
-            .store_table_metadata(
-                &database,
-                &table,
+        if let Err(e) = self
+            .record_new_mirror(
+                &mooncake_table_id,
+                initial_copy_lsn,
+                &mirror_status,
                 &src_table_name,
                 &src_uri,
-                moonlink_table_config?,
+                moonlink_table_config,
             )
-            .await?;
-
+            .await
+        {
+            let mut manager = self.replication_manager.write().await;
+            if manager.is_same_mirror(&mooncake_table_id, &mirror_status) {
+                if let Err(drop_error) = manager.drop_table(&mooncake_table_id).await {
+                    tracing::warn!(error = %drop_error, table = %mooncake_table_id, "failed to drop a mirror that could not be recorded");
+                }
+            }
+            return Err(e);
+        }
         Ok(())
     }
 
-    /// Set Avro schema for an existing table
-    ///
-    /// # Arguments
-    ///
-    /// * src_table_name: Source table name (typically matches the table name used in create_table)
-    /// * avro_schema: Avro schema for parsing data
-    pub async fn set_avro_schema(
+    /// Record a new mirror in the metadata store, once its initial copy is persisted. Recovery
+    /// resumes a recorded mirror from its iceberg table and the replication slot, which only holds
+    /// changes after the copy: copied rows that are not persisted yet would be lost for good. A
+    /// restart before the mirror is recorded loses the whole mirror, and create_table fails.
+    async fn record_new_mirror(
         &self,
-        src_table_name: String,
-        avro_schema: AvroSchema,
+        mooncake_table_id: &MooncakeTableId,
+        initial_copy_lsn: Option<u64>,
+        mirror_status: &watch::Receiver<moonlink::TableStatus>,
+        src_table_name: &str,
+        src_uri: &str,
+        moonlink_table_config: moonlink::MoonlinkTableConfig,
     ) -> Result<()> {
-        validate_not_empty(&src_table_name, "src_table_name")?;
-
+        if let Some(lsn) = initial_copy_lsn {
+            self.wait_for_persistence(mooncake_table_id, lsn, mirror_status)
+                .await?;
+        }
+        // Under the manager lock, so a concurrent drop either removes the record afterwards or
+        // finds no mirror to record.
         let mut manager = self.replication_manager.write().await;
-        // Set Avro schema on the existing REST table
-        manager.set_avro_schema(src_table_name, avro_schema).await?;
-
+        if !manager.is_same_mirror(mooncake_table_id, mirror_status) {
+            return Err(mirror_dropped_error(mooncake_table_id));
+        }
+        self.metadata_store_accessor
+            .store_table_metadata(
+                &mooncake_table_id.database,
+                &mooncake_table_id.table,
+                src_table_name,
+                src_uri,
+                moonlink_table_config,
+            )
+            .await?;
         Ok(())
+    }
+
+    /// The manager, write-locked once no earlier connection to `src_uri`'s database is shutting
+    /// down. Such a shutdown is waited for without the lock, which every other request needs; it is
+    /// found by connection string first and then, under the lock, by the database's source key
+    /// (another connection string for the same database, or a shutdown that began meanwhile). All
+    /// waits share one deadline, after which the request fails with a retryable error.
+    async fn lock_manager_for_new_mirror(
+        &self,
+        src_uri: &str,
+    ) -> Result<tokio::sync::RwLockWriteGuard<'_, ReplicationManager>> {
+        let deadline = tokio::time::Instant::now() + moonlink_connectors::SHUTDOWN_WAIT;
+        let pending = self
+            .replication_manager
+            .read()
+            .await
+            .pending_shutdowns_for_uri(src_uri);
+        pending.wait_until(deadline).await?;
+        loop {
+            let mut manager = self.replication_manager.write().await;
+            let pending = manager.pending_shutdowns_for_source(src_uri).await?;
+            if pending.is_empty() {
+                return Ok(manager);
+            }
+            drop(manager);
+            pending.wait_until(deadline).await?;
+        }
+    }
+
+    /// Wait until the mirror has persisted everything up to `lsn` into iceberg. A failed
+    /// persistence is retried by the table handler with backoff, so it does not end the wait; a
+    /// full disk, the mirror erroring (the handler gives up), stopping, or being dropped does. A
+    /// full disk only clears once someone frees space, and nothing else would end this wait.
+    async fn wait_for_persistence(
+        &self,
+        mooncake_table_id: &MooncakeTableId,
+        lsn: u64,
+        mirror_status: &watch::Receiver<moonlink::TableStatus>,
+    ) -> Result<()> {
+        loop {
+            let rx = {
+                let mut manager = self.replication_manager.write().await;
+                if !manager.is_same_mirror(mooncake_table_id, mirror_status) {
+                    return Err(mirror_dropped_error(mooncake_table_id));
+                }
+                let writer = manager.get_table_event_manager(mooncake_table_id)?;
+                writer.initiate_snapshot(lsn).await
+            };
+            let Err(e) = TableEventManager::synchronize_force_snapshot_request(rx, lsn).await
+            else {
+                return Ok(());
+            };
+            if e.is_storage_full() {
+                return Err(Error::disk_full(format!(
+                    "disk full during the initial copy of mirror {mooncake_table_id}: {e}; free \
+                     disk space and create the mirror again"
+                )));
+            }
+            if mirror_status.has_changed().is_err()
+                || *mirror_status.borrow() != moonlink::TableStatus::Healthy
+            {
+                return Err(e.into());
+            }
+            tracing::warn!(error = %e, table = %mooncake_table_id, lsn, "persisting the initial copy failed, waiting for the retry");
+            #[cfg(feature = "test-utils")]
+            moonlink::test_hooks::record_persistence_wait_retry();
+            // Retries follow the handler's backoff; this only keeps an unexpected immediate
+            // failure from spinning.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     pub async fn drop_table(&self, database: String, table: String) -> Result<()> {
@@ -266,18 +449,25 @@ impl MoonlinkBackend {
 
         let mooncake_table_id = MooncakeTableId { database, table };
 
-        let table_exists = {
-            let mut manager = self.replication_manager.write().await;
-            manager.drop_table(&mooncake_table_id).await?
-        };
-        if !table_exists {
+        // Under the manager lock, like create_table's recording, so a drop and a create of the same
+        // name cannot interleave their metadata changes.
+        let mut manager = self.replication_manager.write().await;
+        if !manager.drop_table(&mooncake_table_id).await? {
             return Ok(());
         }
-
-        self.metadata_store_accessor
+        match self
+            .metadata_store_accessor
             .delete_table_metadata(&mooncake_table_id.database, &mooncake_table_id.table)
-            .await?;
-        Ok(())
+            .await
+        {
+            Ok(()) => Ok(()),
+            // A mirror dropped while create_table still waits for its copy is not recorded yet.
+            Err(e) if is_missing_metadata(&e) => {
+                tracing::debug!(table = %mooncake_table_id, "dropped a mirror that was not recorded yet");
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Get the base directory for all mooncake tables.
@@ -318,6 +508,12 @@ impl MoonlinkBackend {
             table_state_reader.get_current_table_schema().await?
         };
         Ok(table_schema)
+    }
+
+    /// The errored and the pending mirrors the periodic warning names after a restart.
+    #[cfg(feature = "test-utils")]
+    pub async fn placeholder_mirror_names(&self) -> (Vec<String>, Vec<String>) {
+        recovery_utils::placeholder_names(&self.replication_manager.read().await.placeholders())
     }
 
     /// List all tables at moonlink backend, and return their states.
@@ -361,7 +557,7 @@ impl MoonlinkBackend {
         validate_not_empty(&database, "database")?;
         validate_not_empty(&table, "table")?;
 
-        let mut rx = {
+        let rx = {
             let mut manager = self.replication_manager.write().await;
             let mooncake_table_id = MooncakeTableId { database, table };
             let writer = manager.get_table_event_manager(&mooncake_table_id)?;
@@ -375,10 +571,27 @@ impl MoonlinkBackend {
                     "Unrecognizable table optimization mode `{mode}`, expected one of `data`, `index`, or `full`"
                     )));
                 }
-            }
+            }?
         };
 
-        rx.recv().await.unwrap().unwrap();
+        TableEventManager::synchronize_maintenance_request(rx).await?;
+        Ok(())
+    }
+
+    /// Put a mirror into the errored state, as a runtime failure would.
+    #[cfg(feature = "test-utils")]
+    pub async fn enter_errored_for_testing(
+        &self,
+        database: String,
+        table: String,
+        reason: String,
+    ) -> Result<()> {
+        let mut manager = self.replication_manager.write().await;
+        let mooncake_table_id = MooncakeTableId { database, table };
+        manager
+            .get_table_event_manager(&mooncake_table_id)?
+            .enter_errored(reason)
+            .await?;
         Ok(())
     }
 
@@ -392,37 +605,42 @@ impl MoonlinkBackend {
         validate_not_empty(&database, "database")?;
         validate_not_empty(&table, "table")?;
 
-        let read_state = {
-            let manager = self.replication_manager.read().await;
-            let mooncake_table_id = MooncakeTableId { database, table };
-            let table_reader = manager.get_table_reader(&mooncake_table_id)?;
-            table_reader.try_read(lsn).await?
-        };
-
-        Ok(read_state.clone())
-    }
-
-    /// Wait for the WAL flush LSN to reach the requested LSN. Note that WAL flush LSN will update
-    /// up till the latest commit that has been persisted in to the WAL.
-    pub async fn wait_for_wal_flush(
-        &self,
-        database: String,
-        table: String,
-        lsn: u64,
-    ) -> Result<()> {
-        validate_not_empty(&database, "database")?;
-        validate_not_empty(&table, "table")?;
-
-        let mut manager = self.replication_manager.write().await;
         let mooncake_table_id = MooncakeTableId { database, table };
-        let writer = manager.get_table_event_manager(&mooncake_table_id)?;
-
-        // Wait for WAL flush LSN to reach the requested LSN
-        let mut rx = writer.subscribe_wal_flush_lsn();
-        while *rx.borrow() < lsn {
-            rx.changed().await.unwrap();
+        // Do not hold the manager lock while waiting for the LSN: a queued writer (drop/create
+        // table) would otherwise block every scan of every table behind this wait.
+        let table_reader = {
+            let manager = self.replication_manager.read().await;
+            manager.get_table_reader(&mooncake_table_id)?
+        };
+        let timeout = self.lsn_wait_timeout();
+        match tokio::time::timeout(timeout, table_reader.try_read(lsn)).await {
+            Ok(read_state) => Ok(read_state?),
+            Err(_) => {
+                let (snapshot_lsn, commit_lsn, replication_lsn) = table_reader.lsn_status();
+                let snapshot_lsn = if snapshot_lsn == u64::MAX {
+                    "none".to_string()
+                } else {
+                    snapshot_lsn.to_string()
+                };
+                let requested = lsn.unwrap_or_default();
+                if table_reader.lsn_reached(lsn) {
+                    // Replication is there; building the read (another scan's, which this one
+                    // queues behind, or its own) is what did not finish.
+                    return Err(Error::lsn_wait_timeout(format!(
+                        "reading mirror {mooncake_table_id} at LSN {requested} did not finish within \
+                         {timeout:?} (replicated up to {replication_lsn}, snapshot {snapshot_lsn}); \
+                         reading its files is slow or stuck. Retry."
+                    )));
+                }
+                Err(Error::lsn_wait_timeout(format!(
+                    "mirror {mooncake_table_id} did not reach LSN {} within {timeout:?} \
+                     (replicated up to {replication_lsn}, committed {commit_lsn}, snapshot {snapshot_lsn}); \
+                     replication may be stalled or catching up, or src_uri points at a different server \
+                     whose LSNs are not comparable. Retry, or check mooncake.list_tables().",
+                    lsn.unwrap_or_default()
+                )))
+            }
         }
-        Ok(())
     }
 
     /// Gracefully shutdown a replication connection identified by its URI.
@@ -432,29 +650,24 @@ impl MoonlinkBackend {
         let mut manager = self.replication_manager.write().await;
         manager.shutdown_connection(uri, postgres_drop_all);
     }
+}
 
-    /// Initialize event API connection for data ingestion.
-    /// This should be called during service startup to ensure event API is ready.
-    pub async fn initialize_event_api(&mut self) -> Result<()> {
-        let event_api_sender = {
-            let mut manager = self.replication_manager.write().await;
-            manager
-                .initialize_event_api_for_once(&self.base_path)
-                .await?
-        };
-
-        self.event_api_sender = Some(event_api_sender);
-        Ok(())
+/// Whether deleting a mirror's metadata failed because there is none: no row for it, or no
+/// metadata table yet (it is created with the first recorded mirror).
+fn is_missing_metadata(e: &moonlink_metadata_store::error::Error) -> bool {
+    match e {
+        moonlink_metadata_store::error::Error::SqliteRowCountError(_) => true,
+        moonlink_metadata_store::error::Error::Sqlx(_) => e.to_string().contains("no such table"),
+        _ => false,
     }
+}
 
-    pub async fn send_event_request(&self, request: EventRequest) -> Result<()> {
-        self.event_api_sender
-            .as_ref()
-            .expect("event api sender not initialized")
-            .send(request)
-            .await?;
-        Ok(())
-    }
+/// A mirror being created was dropped (or replaced) by a concurrent request.
+fn mirror_dropped_error(mooncake_table_id: &MooncakeTableId) -> Error {
+    moonlink_connectors::Error::table_not_found(format!(
+        "{mooncake_table_id} (dropped while it was being created)"
+    ))
+    .into()
 }
 
 fn validate_not_empty(field: &str, name: &str) -> Result<()> {
@@ -549,5 +762,36 @@ mod tests {
             msg.contains("field_name cannot be empty"),
             "Error message does not contain expected string, got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod lsn_wait_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn lsn_wait_timeout_env_value() {
+        assert_eq!(parse_lsn_wait_timeout(None), DEFAULT_LSN_WAIT_TIMEOUT);
+        assert_eq!(
+            parse_lsn_wait_timeout(Some("120")),
+            Duration::from_secs(120)
+        );
+        assert_eq!(parse_lsn_wait_timeout(Some(" 5 ")), Duration::from_secs(5));
+        // Clamped instead of wrapping when converted to milliseconds.
+        for huge in ["86401", "18446744073709551615"] {
+            assert_eq!(parse_lsn_wait_timeout(Some(huge)), MAX_LSN_WAIT_TIMEOUT);
+        }
+        assert_eq!(clamp_lsn_wait_timeout(Duration::MAX), MAX_LSN_WAIT_TIMEOUT);
+        assert_eq!(
+            clamp_lsn_wait_timeout(Duration::from_secs(3600)),
+            Duration::from_secs(3600)
+        );
+        for invalid in ["0", "-1", "30s", ""] {
+            assert_eq!(
+                parse_lsn_wait_timeout(Some(invalid)),
+                DEFAULT_LSN_WAIT_TIMEOUT,
+                "{invalid:?}"
+            );
+        }
     }
 }
