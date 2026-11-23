@@ -2,7 +2,7 @@
 
 [![Website: mooncake.pgsty.com](https://img.shields.io/badge/Website-mooncake.pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://mooncake.pgsty.com/)
 [![Docs: moonlink](https://img.shields.io/badge/Docs-moonlink-slategray?style=flat)](https://mooncake.pgsty.com/docs/intro/moonlink/)
-[![Version: v0.3.0-pgsty.1](https://img.shields.io/badge/Version-v0.3.0--pgsty.1-slategray?style=flat)](https://github.com/pgsty/moonlink/releases)
+[![Version: v0.3.0-pgsty.2](https://img.shields.io/badge/Version-v0.3.0--pgsty.2-slategray?style=flat)](https://github.com/pgsty/moonlink/releases)
 [![License: BSL-1.1 + Exception](https://img.shields.io/badge/License-BSL--1.1%20%2B%20Exception-slategray?style=flat)](https://github.com/pgsty/moonlink/blob/main/LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/pgsty/moonlink?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/moonlink&Date)
 
@@ -43,11 +43,17 @@ Postgres ───►│  ││  index  │ │  cache  ││  ├──►│
              └─────────────────────────────┘                         
 ```
 
-## PGSTY patch release v0.3.0-pgsty.1
+## PGSTY patch release v0.3.0-pgsty.2
+
+A forced snapshot now waits for Iceberg to persist the table's published commits. A source commit
+could previously reach the replication watermark while the table handler was still processing an
+older snapshot, allowing `create_snapshot` to return early. Rust callers constructing a `TableHandler`
+pass the table's commit watch alongside its replication watch. Publish the table commit position
+before enqueueing its commit event, then advance the replication position after enqueueing.
 
 The upstream-aligned `v0.3.0` tag remains at `dcf999a9`. The downstream patch release adds
-generation-checked mirror management and source-side WAL watermarks for `pg_mooncake 0.3.2`
-and scanner `v0.0.4`. It separates scratch storage from Iceberg tables and checks for
+generation-checked mirror management and source-side WAL watermarks for `pg_mooncake 0.3.3`
+and scanner `v0.0.5`. It separates scratch storage from Iceberg tables and checks for
 legacy WAL before recovery. Each new local mirror requires a fresh Iceberg table directory.
 If a previous creation was interrupted and left a directory, verify its ownership and move it
 aside before retrying. Give each deployment exclusive ownership of its object-store table prefixes.

@@ -56,6 +56,35 @@ async fn persisted_lsn_after_queued_events(env: &mut TestEnvironment) -> u64 {
     reported_lsn
 }
 
+#[tokio::test]
+async fn a_published_commit_cannot_be_acknowledged_before_iceberg_persists_it() {
+    let directory = tempdir().unwrap();
+    let config = config_without_background_persistence(&directory);
+    let mut env = TestEnvironment::new(directory, config.clone()).await;
+    env.set_readable_lsn(10);
+    assert_eq!(persisted_lsn_after_queued_events(&mut env).await, 0);
+
+    env.append_row(1, "first", 30, 9, None).await;
+    env.commit(10).await;
+    let completion = env.table_event_manager.initiate_snapshot(10).await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        TableEventManager::synchronize_force_snapshot_request(completion, 10),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut iceberg = env.create_iceberg_table_manager(config).await;
+    let (_, snapshot) = iceberg.load_snapshot_from_table().await.unwrap();
+    assert_eq!(snapshot.flush_lsn, Some(10));
+
+    env.set_replication_lsn(15);
+    assert_eq!(persisted_lsn_after_queued_events(&mut env).await, 15);
+    env.set_readable_lsn(20);
+    assert_eq!(persisted_lsn_after_queued_events(&mut env).await, 10);
+    env.shutdown().await;
+}
+
 /// A table that has committed but never persisted, and has received a write since its last
 /// commit, has no consistent view. That used to count as "no activity at all", so the forced
 /// snapshot was answered at once with the replication LSN, although iceberg held nothing.

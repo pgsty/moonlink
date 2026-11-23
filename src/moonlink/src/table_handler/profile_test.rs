@@ -351,7 +351,7 @@ impl TestEnvironment {
         let read_state_manager = ReadStateManager::new(
             &table,
             replication_lsn_rx.clone(),
-            last_commit_lsn_rx,
+            last_commit_lsn_rx.clone(),
             table_event_sync_receiver.table_status_rx.clone(),
             read_state_filepath_remap,
         );
@@ -360,6 +360,7 @@ impl TestEnvironment {
             table_event_sync_sender,
             create_table_handler_timers(),
             replication_lsn_rx.clone(),
+            last_commit_lsn_rx,
             /*handler_event_replay_tx=*/ None,
             /*table_event_replay_tx=*/ None,
         )
@@ -532,9 +533,9 @@ async fn profile_test_impl(env: TestEnvironment) {
         while let Some(cur_event) = table_events.pop_front() {
             // For commit events, need to set up corresponding replication and commit LSN.
             if let TableEvent::Commit { lsn, .. } = cur_event {
-                replication_lsn_tx.send(lsn).unwrap();
                 last_commit_lsn_tx.send(lsn).unwrap();
                 event_sender.send(cur_event).await.unwrap();
+                replication_lsn_tx.send(lsn).unwrap();
 
                 ingested_event_count += 1;
                 if ingested_event_count > 500

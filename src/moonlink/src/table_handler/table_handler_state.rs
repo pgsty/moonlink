@@ -515,7 +515,12 @@ impl TableHandlerState {
         &self,
         persistence_snapshot_lsn: Option<u64>,
         replication_lsn: u64,
+        source_commit_lsn: u64,
     ) -> u64 {
+        let durable_lsn = persistence_snapshot_lsn.unwrap_or(0);
+        if source_commit_lsn > durable_lsn {
+            return durable_lsn;
+        }
         // Case-1: the table has never committed anything, so there is nothing to persist and the
         // replication LSN indicates current status. A missing consistent view alone doesn't mean
         // that: any write after the last commit clears it.
@@ -533,7 +538,7 @@ impl TableHandlerState {
 
         // Case-3: iceberg snapshot LSN indicates the persisted table LSN.
         // No guarantee an iceberg snapshot has been persisted here.
-        persistence_snapshot_lsn.unwrap_or(0)
+        durable_lsn
     }
 
     /// Notify the persisted table LSN.
@@ -555,9 +560,13 @@ impl TableHandlerState {
         &mut self,
         persistence_snapshot_lsn: u64,
         replication_lsn: u64,
+        source_commit_lsn: u64,
     ) {
-        let persisted_table_lsn =
-            self.get_persisted_table_lsn(Some(persistence_snapshot_lsn), replication_lsn);
+        let persisted_table_lsn = self.get_persisted_table_lsn(
+            Some(persistence_snapshot_lsn),
+            replication_lsn,
+            source_commit_lsn,
+        );
         self.notify_persisted_table_lsn(persisted_table_lsn);
 
         if let Some(largest_force_snapshot_lsn) = self.largest_force_snapshot_lsn {

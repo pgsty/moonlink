@@ -91,7 +91,7 @@ impl TestEnvironment {
         let read_state_manager = Some(Arc::new(ReadStateManager::new(
             &table,
             replication_rx.clone(),
-            last_commit_rx,
+            last_commit_rx.clone(),
             table_event_sync_receiver.table_status_rx.clone(),
             get_read_state_filepath_remap(),
         )));
@@ -105,6 +105,7 @@ impl TestEnvironment {
             table_event_sync_sender,
             table_handler_timer,
             replication_rx.clone(),
+            last_commit_rx,
             /*event_replay_tx=*/ None,
             /*table_event_replay_tx=*/ None,
         )

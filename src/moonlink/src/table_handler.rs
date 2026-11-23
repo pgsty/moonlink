@@ -73,6 +73,7 @@ impl TableHandler {
         event_sync_sender: EventSyncSender,
         mut table_handler_timer: TableHandlerTimer,
         replication_lsn_rx: watch::Receiver<u64>,
+        table_commit_lsn_rx: watch::Receiver<u64>,
         handler_event_replay_tx: Option<mpsc::UnboundedSender<TableEvent>>,
         table_event_replay_tx: Option<mpsc::UnboundedSender<MooncakeTableEvent>>,
     ) -> Self {
@@ -138,6 +139,7 @@ impl TableHandler {
                     event_sync_sender,
                     &mut event_receiver,
                     replication_lsn_rx,
+                    table_commit_lsn_rx,
                     handler_event_replay_tx,
                     table,
                 ))
@@ -172,6 +174,7 @@ impl TableHandler {
         event_sync_sender: EventSyncSender,
         event_receiver: &mut Receiver<TableEvent>,
         replication_lsn_rx: watch::Receiver<u64>,
+        table_commit_lsn_rx: watch::Receiver<u64>,
         handler_event_replay_tx: Option<mpsc::UnboundedSender<TableEvent>>,
         mut table: MooncakeTable,
     ) {
@@ -363,6 +366,7 @@ impl TableHandler {
                         let persisted_table_lsn = table_handler_state.get_persisted_table_lsn(
                             last_persistence_snapshot_lsn,
                             replication_lsn,
+                            *table_commit_lsn_rx.borrow(),
                         );
 
                         if persisted_table_lsn >= requested_lsn {
@@ -754,6 +758,7 @@ impl TableHandler {
                                 table_handler_state.update_iceberg_persisted_lsn(
                                     iceberg_flush_lsn,
                                     replication_lsn,
+                                    *table_commit_lsn_rx.borrow(),
                                 );
                             }
                             Err(e) => {

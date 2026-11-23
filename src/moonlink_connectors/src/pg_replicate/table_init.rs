@@ -146,7 +146,7 @@ pub async fn build_table_components(
     let read_state_manager = ReadStateManager::new(
         &table,
         replication_lsn_rx,
-        commit_lsn_rx,
+        commit_lsn_rx.clone(),
         event_sync_receiver.table_status_rx.clone(),
         table_components.read_state_filepath_remap,
     );
@@ -160,6 +160,7 @@ pub async fn build_table_components(
         event_sync_sender,
         table_handler_timers,
         handler_replication_lsn_rx,
+        commit_lsn_rx,
         /*event_replay_tx=*/ None,
         /*table_event_replay_tx=*/ None,
     )

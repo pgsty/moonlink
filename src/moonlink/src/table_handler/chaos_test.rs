@@ -854,7 +854,7 @@ impl TestEnvironment {
         let read_state_manager = ReadStateManager::new(
             &table,
             replication_lsn_rx.clone(),
-            last_commit_lsn_rx,
+            last_commit_lsn_rx.clone(),
             table_event_sync_receiver.table_status_rx.clone(),
             read_state_filepath_remap,
         );
@@ -865,6 +865,7 @@ impl TestEnvironment {
             table_event_sync_sender,
             create_table_handler_timers(),
             replication_lsn_rx.clone(),
+            last_commit_lsn_rx,
             Some(handler_event_replay_tx),
             Some(table_event_replay_tx),
         )
@@ -1012,6 +1013,11 @@ async fn validate_persisted_iceberg_table(
             }
             Err(e) => panic!("validation load at LSN {snapshot_lsn} failed: {e:?}"),
         };
+        let durable_lsn = table.get_persistence_snapshot_lsn().unwrap_or(0);
+        assert!(
+            durable_lsn >= snapshot_lsn,
+            "forced snapshot acknowledged LSN {snapshot_lsn}, Iceberg holds LSN {durable_lsn}"
+        );
         table.register_table_notify(event_sender).await;
 
         let read_state_filepath_remap =
@@ -1107,14 +1113,15 @@ async fn chaos_test_impl(mut env: TestEnvironment) {
             // Perform table update operations.
             for cur_event in chaos_events.table_events.into_iter() {
                 // For commit events, need to set up corresponding replication and commit LSN.
-                if let TableEvent::Commit { lsn, .. } = cur_event {
-                    replication_lsn_tx.send(lsn).unwrap();
+                if let TableEvent::Commit { lsn, .. } | TableEvent::CommitFlush { lsn, .. } =
+                    cur_event
+                {
                     last_commit_lsn_tx.send(lsn).unwrap();
-                } else if let TableEvent::CommitFlush { lsn, .. } = cur_event {
+                    event_sender.send(cur_event).await.unwrap();
                     replication_lsn_tx.send(lsn).unwrap();
-                    last_commit_lsn_tx.send(lsn).unwrap();
+                } else {
+                    event_sender.send(cur_event).await.unwrap();
                 }
-                event_sender.send(cur_event).await.unwrap();
             }
 
             // Perform snapshot read operation and check.

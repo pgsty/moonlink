@@ -2130,8 +2130,11 @@ fn test_get_persisted_table_lsn() {
         let replication_lsn = 1;
         table_handler_state.table_consistent_view_lsn = None;
 
-        let persisted_table_lsn =
-            table_handler_state.get_persisted_table_lsn(persistence_snapshot_lsn, replication_lsn);
+        let persisted_table_lsn = table_handler_state.get_persisted_table_lsn(
+            persistence_snapshot_lsn,
+            replication_lsn,
+            0,
+        );
         assert_eq!(persisted_table_lsn, 1);
     }
 
@@ -2143,8 +2146,11 @@ fn test_get_persisted_table_lsn() {
         table_handler_state.latest_commit_lsn = Some(4);
         table_handler_state.table_consistent_view_lsn = None;
 
-        let persisted_table_lsn =
-            table_handler_state.get_persisted_table_lsn(persistence_snapshot_lsn, replication_lsn);
+        let persisted_table_lsn = table_handler_state.get_persisted_table_lsn(
+            persistence_snapshot_lsn,
+            replication_lsn,
+            4,
+        );
         assert_eq!(persisted_table_lsn, 0);
     }
 
@@ -2154,8 +2160,11 @@ fn test_get_persisted_table_lsn() {
         let replication_lsn = 2;
         table_handler_state.table_consistent_view_lsn = Some(2);
 
-        let persisted_table_lsn =
-            table_handler_state.get_persisted_table_lsn(persistence_snapshot_lsn, replication_lsn);
+        let persisted_table_lsn = table_handler_state.get_persisted_table_lsn(
+            persistence_snapshot_lsn,
+            replication_lsn,
+            2,
+        );
         assert_eq!(persisted_table_lsn, 1);
     }
 
@@ -2165,8 +2174,11 @@ fn test_get_persisted_table_lsn() {
         let replication_lsn = 2;
         table_handler_state.table_consistent_view_lsn = Some(1);
 
-        let persisted_table_lsn =
-            table_handler_state.get_persisted_table_lsn(persistence_snapshot_lsn, replication_lsn);
+        let persisted_table_lsn = table_handler_state.get_persisted_table_lsn(
+            persistence_snapshot_lsn,
+            replication_lsn,
+            1,
+        );
         assert_eq!(persisted_table_lsn, 2);
     }
 }
