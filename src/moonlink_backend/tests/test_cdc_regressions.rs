@@ -2135,11 +2135,12 @@ async fn dropping_an_errored_placeholder_releases_the_source(
 
 /// Delete a mirror's recorded source fingerprint, as for a mirror an older moonlink recorded.
 fn remove_source_fingerprint(tmp: &TempDir, mirror: &str) {
-    let name: String = format!("{DB}.{mirror}")
-        .bytes()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    std::fs::remove_file(tmp.path().join("source_fingerprints").join(name)).unwrap();
+    let id = moonlink::MooncakeTableId {
+        database: DB.into(),
+        table: mirror.into(),
+    };
+    let directory = tmp.path().join("source_fingerprints");
+    std::fs::remove_file(directory.join(id.storage_key())).unwrap();
 }
 
 /// Restart moonlink (keeping its data) with `ddl` run on the source while it is down.
@@ -4612,7 +4613,27 @@ async fn recreated_mirror_starts_from_the_source_alone(
     assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
     if leave_iceberg_table {
         // As if the drop had been interrupted before deleting it.
-        copy_dir(&saved, &iceberg_table);
+        std::fs::rename(&saved, &iceberg_table).unwrap();
+        let hint = iceberg_table.join("metadata/version-hint.text");
+        let old_version = std::fs::read(&hint).unwrap();
+        let err = backend
+            .create_table(
+                DB.into(),
+                "rv_rc_mc".into(),
+                "public.rv_rc".into(),
+                uri.clone(),
+                table_config(&tmp),
+                None,
+            )
+            .await
+            .unwrap_err();
+        let message = error_text(&err);
+        assert!(
+            message.contains("cannot reserve Iceberg location cdc-regressions/rv_rc_mc"),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(hint).unwrap(), old_version);
+        std::fs::rename(&iceberg_table, &saved).unwrap();
     }
 
     client
